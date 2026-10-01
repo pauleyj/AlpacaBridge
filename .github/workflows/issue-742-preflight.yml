@@ -20,7 +20,7 @@ jobs:
       - name: Checkout the fix commit, excluding this fork-only workflow
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 36db8236925dce69a57cc863a09f56f51db4cbf9
+          ref: d45d4072b7cbd3f4461f0f0564815c85f63e84da
           fetch-depth: 0
           persist-credentials: false
 
@@ -30,7 +30,7 @@ jobs:
           test "$RUNNER_ARCH" = ARM64
           test "$(uname -m)" = aarch64
           test "$(dpkg --print-architecture)" = arm64
-          test "$(git rev-parse HEAD)" = 36db8236925dce69a57cc863a09f56f51db4cbf9
+          test "$(git rev-parse HEAD)" = d45d4072b7cbd3f4461f0f0564815c85f63e84da
           git fetch --no-tags https://github.com/open-astro/AlpacaBridge.git main:refs/remotes/upstream/main
           mkdir -p AlpacaCore/build-preflight-evidence
           {
