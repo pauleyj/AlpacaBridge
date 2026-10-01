@@ -917,13 +917,8 @@ public:
         if (!moving) {
             // Defensive dual-stop, matching the project's convention for
             // fixed-direction (rather than signed-rate) motion protocols.
-            try {
-                protocol.move_axis_stop(positive_dir);
-            } catch (...) {  // NOLINT(bugprone-empty-catch)
-            }
-            try {
-                protocol.move_axis_stop(negative_dir);
-            } catch (...) {  // NOLINT(bugprone-empty-catch)
+            if (auto error = stop_axis_locked(axis)) {
+                throw AlpacaException("MoveAxis stop failed: " + *error, AlpacaError::DriverException);
             }
         } else {
             protocol.move_axis_start(rate > 0.0 ? positive_dir : negative_dir, std::abs(rate));
@@ -962,12 +957,20 @@ public:
         check_connected();
         check_not_parked_locked("AbortSlew");
         auto& protocol = OnStepProtocolWrapper::instance();
-        protocol.abort_slew();
-        for (int dir = 0; dir < 4; ++dir) {
-            try {
-                protocol.move_axis_stop(dir);
-            } catch (...) {  // NOLINT(bugprone-empty-catch)
-            }
+        std::optional<std::string> first_error;
+        try {
+            protocol.abort_slew();
+        } catch (const std::exception& ex) {
+            first_error = ex.what();
+        } catch (...) {
+            first_error = "unknown error";
+        }
+        for (int axis : {1, 0}) {  // Preserve the existing North/South/East/West order.
+            auto error = stop_axis_locked(axis);
+            if (!first_error) first_error = std::move(error);
+        }
+        if (first_error) {
+            throw AlpacaException("AbortSlew stop failed: " + *first_error, AlpacaError::DriverException);
         }
         slewing_cached_ = false;
         slew_force_until_ = std::chrono::steady_clock::time_point::min();
@@ -1005,6 +1008,23 @@ public:
     }
 
 private:
+    // Attempt both directions: either failed stop may be the one the mount needed.
+    // mutex_ is held by the caller; an engaged optional also records an empty message.
+    std::optional<std::string> stop_axis_locked(int axis) {
+        std::optional<std::string> first_error;
+        const int first_direction = axis == 0 ? 2 : 0;
+        for (int direction = first_direction; direction < first_direction + 2; ++direction) {
+            try {
+                OnStepProtocolWrapper::instance().move_axis_stop(direction);
+            } catch (const std::exception& ex) {
+                if (!first_error) first_error = ex.what();
+            } catch (...) {
+                if (!first_error) first_error = "unknown error";
+            }
+        }
+        return first_error;
+    }
+
     void check_connected() const {
         if (!connected_) {
             throw AlpacaException("Not connected to OnStep mount", AlpacaError::NotConnected);

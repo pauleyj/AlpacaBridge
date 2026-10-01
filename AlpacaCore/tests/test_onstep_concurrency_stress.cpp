@@ -53,6 +53,10 @@ void telescope_operate(alpacacore::test::StressCallGuard& guard, AlpacaDriver& d
     guard([&] { static_cast<void>(scope.get_slewing()); });
     guard([&] { scope.slew_to_coordinates_async(5.0, 20.0); });
     guard([&] { scope.pulse_guide(0, 50); });
+    guard([&] { scope.move_axis(0, 0.5); });
+    guard([&] { scope.move_axis(0, 0.0); });
+    guard([&] { scope.move_axis(1, -0.5); });
+    guard([&] { scope.move_axis(1, 0.0); });
     guard([&] { scope.abort_slew(); });
 }
 
