@@ -14,8 +14,10 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace alpacacore::vendor::onstep {
@@ -55,6 +57,11 @@ struct ConnectionInfo {
 
     // Per-command response timeout
     int response_timeout_ms = 5000;
+
+    /// Optional test seam, called before each send under the wrapper mutex.
+    /// May throw to model a failed blind send; must not re-enter the wrapper.
+    /// Captured state must outlive the connection. Not exposed through config.
+    std::function<void(std::string_view)> before_send;
 };
 
 struct Position {

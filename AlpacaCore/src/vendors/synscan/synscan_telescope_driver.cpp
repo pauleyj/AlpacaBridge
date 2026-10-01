@@ -1116,22 +1116,39 @@ public:
         });
     }
 
-    // Park task failure path: stop the hardware so the reported idle state
-    // (Slewing false, AtPark false) matches reality, then drop the parking
-    // state so the caller can retry. mutex_ must be held.
-    void fail_park_locked(const std::string& message) {
-        try {
-            auto& protocol = SynScanProtocolWrapper::instance();
-            protocol.cancel_goto();
-            protocol.move_axis_fixed_rate(0, 0);
-            protocol.move_axis_fixed_rate(1, 0);
-        } catch (...) {  // NOLINT(bugprone-empty-catch)
+    // mutex_ must be held. One failed stop must not skip either remaining stop.
+    std::optional<std::string> stop_park_slew_locked() {
+        std::optional<std::string> first_error;
+        auto& protocol = SynScanProtocolWrapper::instance();
+        for (int axis = -1; axis < 2; ++axis) {
+            try {
+                if (axis < 0) {
+                    protocol.cancel_goto();
+                } else {
+                    protocol.move_axis_fixed_rate(axis, 0);
+                }
+            } catch (const std::exception& ex) {
+                if (!first_error) first_error = ex.what();
+            } catch (...) {
+                if (!first_error) first_error = "unknown error";
+            }
         }
+        return first_error;
+    }
+
+    // Drop the park state so the caller can retry, but publish stopped only if
+    // every stop succeeded. mutex_ must be held.
+    void fail_park_locked(const std::string& message) {
+        auto stop_error = stop_park_slew_locked();
         parking_ = false;
-        slewing_cached_ = false;
+        if (!stop_error) slewing_cached_ = false;
         slew_force_until_ = std::chrono::steady_clock::time_point::min();
         position_override_until_ = std::chrono::steady_clock::time_point::min();
         ALPACA_LOG_WARN("SynScan", message);
+        if (stop_error) {
+            ALPACA_LOG_ERROR("SynScan", "SynScan: stop after park failure failed: " + *stop_error +
+                                            "; the mount may still be moving");
+        }
     }
 
     void pulse_guide(int direction, int duration) override {
@@ -1447,7 +1464,11 @@ public:
     }
 
     void unpark() override {
+        // Own the old task through the join: a new Park/Slew must not start in
+        // the mutex_-released window and get reaped as though it were the old one.
+        std::lock_guard<std::mutex> ilock(initiator_mutex_);
         bool was_parking = false;
+        std::optional<std::string> stop_error;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             check_connected();
@@ -1457,20 +1478,17 @@ public:
                 // Unpark during a park wins the race: stop the park slew and
                 // drop the parking state; the task below is then joined.
                 parking_ = false;
-                auto& protocol = SynScanProtocolWrapper::instance();
-                try {
-                    protocol.cancel_goto();
-                    protocol.move_axis_fixed_rate(0, 0);
-                    protocol.move_axis_fixed_rate(1, 0);
-                } catch (...) {  // NOLINT(bugprone-empty-catch)
-                }
-                slewing_cached_ = false;
+                stop_error = stop_park_slew_locked();
+                if (!stop_error) slewing_cached_ = false;
                 slew_force_until_ = std::chrono::steady_clock::time_point::min();
                 position_override_until_ = std::chrono::steady_clock::time_point::min();
             }
         }
         if (was_parking) {
             reap_slew_task();  // without mutex_ held
+        }
+        if (stop_error) {
+            throw AlpacaException("Unpark could not stop the park slew: " + *stop_error, AlpacaError::DriverException);
         }
     }
 
@@ -1499,7 +1517,6 @@ public:
 
         constexpr double kStopEpsilon = 1e-6;
         const bool moving = std::abs(rate) > kStopEpsilon;
-        manual_axis_slewing_[axis] = moving;
         if (moving) {
             parked_ = false;
             at_home_ = false;
@@ -1510,6 +1527,7 @@ public:
         last_slew_error_.clear();
 
         SynScanProtocolWrapper::instance().move_axis_variable_rate(axis, moving ? rate : 0.0);
+        manual_axis_slewing_[axis] = moving;  // A failed stop must retain the previous motion state.
     }
 
     std::pair<double, double> get_axis_rate_range(int axis) const override {

@@ -21,6 +21,7 @@
 #include <chrono>
 #include <functional>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -231,6 +232,111 @@ TEST_CASE("OnStep Telescope Driver - the two target properties are independent",
 }
 
 #ifndef _WIN32
+
+TEST_CASE("OnStep - failed MoveAxis stops attempt both directions and retain motion", "[onstep][telescope][stop]") {
+    for (int axis : {0, 1}) {
+        for (int failed_stop : {0, 1, 2}) {
+            CAPTURE(axis, failed_stop);
+            const std::vector<std::string> stops =
+                axis == 0 ? std::vector<std::string>{":Qe#", ":Qw#"} : std::vector<std::string>{":Qn#", ":Qs#"};
+            struct State {
+                int failed_stop = -1;
+                std::vector<std::string> attempts;
+            };
+            auto st = std::make_shared<State>();
+            alpacacore::test::FakeMountServer server([](const std::string& command) {
+                // 'N' means NOT slewing: the fake's default '0#' means moving
+                // and would hide a wrongly cleared manual-axis flag (#742).
+                return command == ":GU#" ? std::string("nN#") : std::string("0#");
+            });
+            REQUIRE(server.ok());
+            alpacacore::vendor::onstep::ConnectionInfo info;
+            info.type = alpacacore::vendor::onstep::ConnectionType::Network;
+            info.host = "127.0.0.1";
+            info.tcp_port = server.port();
+            info.response_timeout_ms = 50;
+            info.before_send = [st, stops](std::string_view command) {
+                if (command != stops[0] && command != stops[1]) return;
+                st->attempts.emplace_back(command);
+                if (st->failed_stop == 2 || (st->failed_stop >= 0 && command == stops[st->failed_stop])) {
+                    throw std::runtime_error(std::string(command) + " send failed");
+                }
+            };
+            auto driver = alpacacore::vendor::onstep::create_onstep_telescope(0, info);
+            driver->set_connected(true);
+            REQUIRE_FALSE(driver->get_slewing());
+            driver->move_axis(axis, 0.5);
+            REQUIRE(driver->get_slewing());
+
+            st->failed_stop = failed_stop;
+            try {
+                driver->move_axis(axis, 0.0);
+                FAIL("Expected failed stop to throw");
+            } catch (const alpacacore::AlpacaException& ex) {
+                CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+                CHECK(std::string(ex.what()) ==
+                      "MoveAxis stop failed: " + stops[failed_stop == 1 ? 1 : 0] + " send failed");
+            }
+            CHECK(st->attempts == stops);
+            CHECK(driver->get_slewing());
+
+            // Stopping the other axis must not clear the failed axis's flag.
+            driver->move_axis(1 - axis, 0.5);
+            driver->move_axis(1 - axis, 0.0);
+            CHECK(driver->get_slewing());
+            st->failed_stop = -1;
+            st->attempts.clear();
+            REQUIRE_NOTHROW(driver->move_axis(axis, 0.0));
+            CHECK(st->attempts == stops);
+            CHECK_FALSE(driver->get_slewing());
+        }
+    }
+}
+
+TEST_CASE("OnStep - failed AbortSlew attempts every stop and retains motion", "[onstep][telescope][stop]") {
+    const std::vector<std::string> stops{":Q#", ":Qn#", ":Qs#", ":Qe#", ":Qw#"};
+    for (const auto& failed_stop : stops) {
+        CAPTURE(failed_stop);
+        struct State {
+            bool fail = false;
+            std::vector<std::string> attempts;
+        };
+        auto st = std::make_shared<State>();
+        alpacacore::test::FakeMountServer server(
+            [](const std::string& command) { return command == ":GU#" ? std::string("nN#") : std::string("0#"); });
+        REQUIRE(server.ok());
+        alpacacore::vendor::onstep::ConnectionInfo info;
+        info.type = alpacacore::vendor::onstep::ConnectionType::Network;
+        info.host = "127.0.0.1";
+        info.tcp_port = server.port();
+        info.response_timeout_ms = 50;
+        info.before_send = [st, failed_stop](std::string_view command) {
+            if (command.substr(0, 2) != ":Q") return;
+            st->attempts.emplace_back(command);
+            if (st->fail && command == failed_stop) throw alpacacore::AlpacaException("stop send failed");
+        };
+        auto driver = alpacacore::vendor::onstep::create_onstep_telescope(0, info);
+        driver->set_connected(true);
+        REQUIRE_FALSE(driver->get_slewing());
+        driver->move_axis(0, 0.5);
+        driver->move_axis(1, 0.5);
+        st->fail = true;
+        try {
+            driver->abort_slew();
+            FAIL_CHECK("Expected failed abort to throw");
+        } catch (const alpacacore::AlpacaException& ex) {
+            CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+            CHECK(std::string(ex.what()) == "AbortSlew stop failed: stop send failed");
+        }
+        CHECK(st->attempts == stops);
+        CHECK(driver->get_slewing());
+        st->fail = false;
+        st->attempts.clear();
+        REQUIRE_NOTHROW(driver->abort_slew());
+        CHECK(st->attempts == stops);
+        CHECK_FALSE(driver->get_slewing());
+    }
+}
 
 // ── The client-clock disagreement warning (#409) ─────────────────────────────
 

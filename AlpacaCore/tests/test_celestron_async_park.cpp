@@ -19,9 +19,11 @@
 
 #include <alpacacore/telescope_driver.h>
 #include <alpacacore/util/error_handling.h>
+#include <alpacacore/util/logging.h>
 #include <alpacacore/vendor/celestron/celestron_protocol_wrapper.h>
 #include <alpacacore/vendor/celestron/celestron_telescope_driver.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -40,9 +42,17 @@ struct FakeCelestronState {
     std::atomic<bool> goto_seen{false};
     std::atomic<int> goto_count{0};
     std::atomic<Clock::rep> goto_started{0};
+    std::atomic<bool> hold_goto{false};
+    std::atomic<bool> muted{false};
+    std::atomic<bool> fail_dispatch{false};
+    std::atomic<bool> fail_axis_stop{false};
+    std::atomic<int> failed_stop{-1};
+    std::array<std::atomic<int>, 3> stop_attempts{};
+    std::atomic<int> status_polls{0};
     static constexpr auto kGotoDuration = std::chrono::milliseconds(1500);
     bool goto_in_progress() const {
         if (!goto_seen.load()) return false;
+        if (hold_goto.load()) return true;
         const auto started = Clock::time_point(Clock::duration(goto_started.load()));
         return Clock::now() - started < kGotoDuration;
     }
@@ -51,6 +61,28 @@ struct FakeCelestronState {
 alpacacore::test::FakeMountServer::Responder celestron_responder(std::shared_ptr<FakeCelestronState> st) {
     return [st](const std::string& chunk) -> std::string {
         if (chunk.empty()) return "0#";
+        const bool passthrough = chunk.size() == 8 && chunk[0] == 'P';
+        const unsigned char op = passthrough ? static_cast<unsigned char>(chunk[3]) : 0;
+        if (chunk[0] == 'L' || (passthrough && op == 0x13)) ++st->status_polls;
+        if (passthrough && (op == 6 || op == 7) && chunk[4] == 0 && chunk[5] == 0 && st->fail_axis_stop.load()) {
+            st->muted.store(true);
+        }
+        int stop = -1;
+        if (chunk == "M") stop = 0;
+        if (passthrough && (op == 36 || op == 37) && chunk[4] == 0) {
+            stop = chunk[2] == 16 ? 1 : 2;
+        }
+        if (stop >= 0) {
+            if (chunk == "M" || op == 36) ++st->stop_attempts[stop];
+            if (st->failed_stop.load() == stop) return "";
+        }
+        const bool goto_command = chunk[0] == 'r' || chunk[0] == 'R' || chunk[0] == 'b' || chunk[0] == 'B' ||
+                                  (passthrough && (op == 0x02 || op == 0x17));
+        if (goto_command && st->fail_dispatch.load()) {
+            st->goto_seen.store(true);
+            st->muted.store(true);
+        }
+        if (st->muted.load()) return "";
         switch (chunk[0]) {
             case 'e':
             case 'E':
@@ -85,6 +117,7 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(std::shared_ptr
                 if (op == 0x13) {  // MC_SLEW_DONE: 0x00 = still slewing, 0xFF = done
                     return st->goto_in_progress() ? std::string("\x00#", 2) : std::string("\xFF#");
                 }
+                if (op == 0xFE) return std::string("\x01\x00#", 3);  // GET_VER: two binary bytes, then '#'
                 return std::string("\xFF#");
             }
             default:
@@ -187,6 +220,110 @@ TEST_CASE("Celestron async - Unpark during a park cancels it", "[celestron][tele
     driver->park();
     driver->set_connected(false);
     REQUIRE_FALSE(driver->get_connected());
+}
+
+TEST_CASE("Celestron - Unpark attempts every stop and reports failures truthfully", "[celestron][telescope][stop]") {
+    // -1 = success, 0/1/2 = a selected stop fails, 3 = the whole link is silent.
+    for (int failed_stop : {-1, 0, 1, 2, 3}) {
+        CAPTURE(failed_stop);
+        auto st = std::make_shared<FakeCelestronState>();
+        st->hold_goto.store(true);
+        alpacacore::test::FakeMountServer server(celestron_responder(st));
+        REQUIRE(server.ok());
+        auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+        driver->set_connected(true);
+        driver->park();
+        REQUIRE(wait_until([&] { return st->goto_seen.load(); }, 5000));
+        st->failed_stop.store(failed_stop);
+        st->muted.store(failed_stop == 3);
+        if (failed_stop < 0) {
+            REQUIRE_NOTHROW(driver->unpark());
+        } else {
+            try {
+                driver->unpark();
+                FAIL_CHECK("Expected failed park stop to throw");
+            } catch (const alpacacore::AlpacaException& ex) {
+                CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+                CHECK(std::string(ex.what()) ==
+                      "Unpark could not stop the park slew: Timeout waiting for Celestron response");
+            }
+        }
+        for (const auto& attempts : st->stop_attempts) CHECK(attempts.load() == 1);
+        REQUIRE_FALSE(driver->get_at_park());
+        st->muted.store(true);
+        const int polls = st->status_polls.load();
+        CHECK(driver->get_slewing() == (failed_stop >= 0));
+        // Prove the real polling path ran, rather than a timed slew grace
+        // window or a still-running park task making Slewing true by accident.
+        CHECK(st->status_polls.load() > polls);
+
+        st->muted.store(false);
+        st->failed_stop.store(-1);
+        st->hold_goto.store(false);
+        // Retry is allowed: the failed Unpark cleared parking_ and joined its
+        // task. The new park must not be cancelled by the old worker's tail.
+        driver->park();
+        REQUIRE(wait_until([&] { return driver->get_at_park(); }, 20000));
+        CHECK_FALSE(driver->get_slewing());
+    }
+}
+
+TEST_CASE("Celestron - failed park cleanup logs failed stops and retains motion", "[celestron][telescope][stop]") {
+    auto st = std::make_shared<FakeCelestronState>();
+    std::atomic<bool> error_seen{false};
+    struct SinkGuard {
+        alpacacore::logging::LogSink previous = alpacacore::logging::get_log_sink();
+        ~SinkGuard() { alpacacore::logging::set_log_sink(previous); }
+    } sink_guard;
+    alpacacore::logging::set_log_sink(
+        [&](alpacacore::logging::LogLevel level, std::string_view component, std::string_view message) {
+            if (level == alpacacore::logging::LogLevel::Error && component == "Celestron" &&
+                message ==
+                    "Celestron: stop after park failure failed: Timeout waiting for Celestron response; "
+                    "the mount may still be moving") {
+                error_seen.store(true);
+            }
+        });
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+    driver->set_connected(true);
+    st->fail_dispatch.store(true);
+    driver->park();
+    REQUIRE(wait_until([&] { return st->stop_attempts[0].load() > 0; }, 5000));
+    CHECK(wait_until([&] { return error_seen.load(); }, 5000));
+    for (const auto& attempts : st->stop_attempts) CHECK(attempts.load() == 1);
+    REQUIRE_FALSE(driver->get_at_park());
+    const int polls = st->status_polls.load();
+    CHECK(driver->get_slewing());
+    CHECK(st->status_polls.load() > polls);
+
+    st->fail_dispatch.store(false);
+    st->muted.store(false);
+    driver->park();
+    REQUIRE(wait_until([&] { return driver->get_at_park(); }, 20000));
+    CHECK_FALSE(driver->get_slewing());
+}
+
+TEST_CASE("Celestron - failed MoveAxis stop retains the manual motion flag", "[celestron][telescope][stop]") {
+    for (int axis : {0, 1}) {
+        CAPTURE(axis);
+        auto st = std::make_shared<FakeCelestronState>();
+        alpacacore::test::FakeMountServer server(celestron_responder(st));
+        REQUIRE(server.ok());
+        auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+        driver->set_connected(true);
+        REQUIRE_FALSE(driver->get_slewing());
+        driver->move_axis(axis, 0.5);
+        REQUIRE(driver->get_slewing());
+        st->fail_axis_stop.store(true);
+        CHECK_THROWS_AS(driver->move_axis(axis, 0.0), alpacacore::AlpacaException);
+        CHECK(driver->get_slewing());
+        st->fail_axis_stop.store(false);
+        st->muted.store(false);
+        REQUIRE_NOTHROW(driver->move_axis(axis, 0.0));
+        CHECK_FALSE(driver->get_slewing());
+    }
 }
 
 #endif  // !_WIN32

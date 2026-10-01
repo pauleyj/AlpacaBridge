@@ -573,6 +573,7 @@ public:
     }
 
     void disconnect_locked() {
+        connection_info_.before_send = {};
         if (!connected_) {
             return;
         }
@@ -1122,6 +1123,9 @@ private:
     }
 
     bool write_data(const std::string& data) {
+        if (connection_info_.before_send) {
+            connection_info_.before_send(data);
+        }
         if (connection_type_ == ConnectionType::Serial) {
             return util::write_all(serial_fd_, data.c_str(), data.length());
         }

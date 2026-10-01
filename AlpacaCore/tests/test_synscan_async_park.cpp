@@ -19,9 +19,11 @@
 
 #include <alpacacore/telescope_driver.h>
 #include <alpacacore/util/error_handling.h>
+#include <alpacacore/util/logging.h>
 #include <alpacacore/vendor/synscan/synscan_protocol_wrapper.h>
 #include <alpacacore/vendor/synscan/synscan_telescope_driver.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -40,9 +42,18 @@ struct FakeSynScanState {
     std::atomic<bool> goto_seen{false};
     std::atomic<int> goto_count{0};
     std::atomic<Clock::rep> goto_started{0};
+    std::atomic<bool> hold_goto{false};
+    std::atomic<bool> muted{false};
+    std::atomic<bool> fail_dispatch{false};
+    std::atomic<bool> fail_axis_stop{false};
+    std::atomic<bool> fail_sends{false};
+    std::atomic<int> failed_stop{-1};
+    std::array<std::atomic<int>, 3> stop_attempts{};
+    std::atomic<int> status_polls{0};
     static constexpr auto kGotoDuration = std::chrono::milliseconds(1500);
     bool goto_in_progress() const {
         if (!goto_seen.load()) return false;
+        if (hold_goto.load()) return true;
         const auto started = Clock::time_point(Clock::duration(goto_started.load()));
         return Clock::now() - started < kGotoDuration;
     }
@@ -51,6 +62,12 @@ struct FakeSynScanState {
 alpacacore::test::FakeMountServer::Responder synscan_responder(std::shared_ptr<FakeSynScanState> st) {
     return [st](const std::string& chunk) -> std::string {
         if (chunk.empty()) return "0#";
+        if (chunk[0] == 'L') ++st->status_polls;
+        if (chunk[0] == 'r' && st->fail_dispatch.load()) {
+            st->goto_seen.store(true);
+            st->muted.store(true);
+        }
+        if (st->muted.load()) return "";
         switch (chunk[0]) {
             case 'K':  // protocol echo: "K" + byte -> byte + "#" (the connect-time link check)
                 return std::string(1, chunk.size() > 1 ? chunk[1] : 'K') + "#";
@@ -83,12 +100,34 @@ alpacacore::test::FakeMountServer::Responder synscan_responder(std::shared_ptr<F
     };
 }
 
-alpacacore::vendor::synscan::ConnectionInfo endpoint(int port) {
+alpacacore::vendor::synscan::ConnectionInfo endpoint(int port, std::shared_ptr<FakeSynScanState> st = {}) {
     alpacacore::vendor::synscan::ConnectionInfo info;
     info.type = alpacacore::vendor::synscan::ConnectionType::Network;
     info.host = "127.0.0.1";
     info.tcp_port = port;
     info.response_timeout_ms = 200;
+    if (st) {
+        info.before_send = [st](std::string_view command) {
+            if (command.size() == 8 && command[0] == 'P' && command[3] == 6 && command[4] == 0 && command[5] == 0 &&
+                st->fail_axis_stop.load()) {
+                st->muted.store(true);
+                throw alpacacore::AlpacaException("axis stop send failed");
+            }
+            int stop = -1;
+            if (command == "M") stop = 0;
+            if (command.size() == 8 && command[0] == 'P' && command[3] == 36 && command[4] == 0) {
+                stop = command[2] == 16 ? 1 : 2;
+            }
+            if (stop < 0) return;
+            ++st->stop_attempts[stop];
+            const int failed = st->failed_stop.load();
+            if (!st->fail_sends.load() || (failed != stop && failed < 3)) return;
+            if (failed == 4 && stop == 0) throw 42;  // non-standard transport failure
+            if (failed == 5 && stop == 0) throw alpacacore::AlpacaException("");
+            static constexpr const char* errors[]{"cancel send failed", "RA stop send failed", "Dec stop send failed"};
+            throw alpacacore::AlpacaException(errors[stop]);
+        };
+    }
     return info;
 }
 
@@ -373,6 +412,115 @@ TEST_CASE("SynScan async - Unpark during a park cancels it", "[synscan][telescop
     driver->park();
     driver->set_connected(false);
     REQUIRE_FALSE(driver->get_connected());
+}
+
+TEST_CASE("SynScan - Unpark attempts every stop and reports failures truthfully", "[synscan][telescope][stop]") {
+    // Selected first/later failures, all stops failing, non-standard failure,
+    // and an empty FIRST message followed by non-empty later failures.
+    for (int failed_stop : {-1, 0, 1, 2, 3, 4, 5}) {
+        CAPTURE(failed_stop);
+        auto st = std::make_shared<FakeSynScanState>();
+        st->hold_goto.store(true);
+        alpacacore::test::FakeMountServer server(synscan_responder(st));
+        REQUIRE(server.ok());
+        auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
+            0, endpoint(server.port(), st), alpacacore::vendor::synscan::SynScanVersion::V4);
+        driver->set_connected(true);
+        driver->park();
+        REQUIRE(wait_until([&] { return st->goto_seen.load(); }, 5000));
+        st->failed_stop.store(failed_stop);
+        st->fail_sends.store(failed_stop >= 0);
+        st->muted.store(failed_stop >= 3);
+        if (failed_stop < 0) {
+            REQUIRE_NOTHROW(driver->unpark());
+        } else {
+            try {
+                driver->unpark();
+                FAIL_CHECK("Expected failed park stop to throw");
+            } catch (const alpacacore::AlpacaException& ex) {
+                CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+                static constexpr const char* errors[]{"cancel send failed",   "RA stop send failed",
+                                                      "Dec stop send failed", "cancel send failed",
+                                                      "unknown error",        ""};
+                CHECK(std::string(ex.what()) ==
+                      std::string("Unpark could not stop the park slew: ") + errors[failed_stop]);
+            }
+        }
+        for (const auto& attempts : st->stop_attempts) CHECK(attempts.load() == 1);
+        REQUIRE_FALSE(driver->get_at_park());
+        st->muted.store(true);
+        const int polls = st->status_polls.load();
+        CHECK(driver->get_slewing() == (failed_stop >= 0));
+        CHECK(st->status_polls.load() > polls);  // no grace window or old park task masking the cache
+
+        st->fail_sends.store(false);
+        st->muted.store(false);
+        st->hold_goto.store(false);
+        driver->park();
+        REQUIRE(wait_until([&] { return driver->get_at_park(); }, 20000));
+        CHECK_FALSE(driver->get_slewing());
+    }
+}
+
+TEST_CASE("SynScan - failed park cleanup logs failed stops and retains motion", "[synscan][telescope][stop]") {
+    auto st = std::make_shared<FakeSynScanState>();
+    std::atomic<bool> error_seen{false};
+    struct SinkGuard {
+        alpacacore::logging::LogSink previous = alpacacore::logging::get_log_sink();
+        ~SinkGuard() { alpacacore::logging::set_log_sink(previous); }
+    } sink_guard;
+    alpacacore::logging::set_log_sink([&](alpacacore::logging::LogLevel level, std::string_view component,
+                                          std::string_view message) {
+        if (level == alpacacore::logging::LogLevel::Error && component == "SynScan" &&
+            message == "SynScan: stop after park failure failed: cancel send failed; the mount may still be moving") {
+            error_seen.store(true);
+        }
+    });
+    alpacacore::test::FakeMountServer server(synscan_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
+        0, endpoint(server.port(), st), alpacacore::vendor::synscan::SynScanVersion::V4);
+    driver->set_connected(true);
+    st->failed_stop.store(3);
+    st->fail_sends.store(true);
+    st->fail_dispatch.store(true);
+    driver->park();
+    REQUIRE(wait_until([&] { return st->stop_attempts[0].load() > 0; }, 5000));
+    CHECK(wait_until([&] { return error_seen.load(); }, 5000));
+    for (const auto& attempts : st->stop_attempts) CHECK(attempts.load() == 1);
+    REQUIRE_FALSE(driver->get_at_park());
+    const int polls = st->status_polls.load();
+    CHECK(driver->get_slewing());
+    CHECK(st->status_polls.load() > polls);
+
+    st->fail_sends.store(false);
+    st->fail_dispatch.store(false);
+    st->muted.store(false);
+    driver->park();
+    REQUIRE(wait_until([&] { return driver->get_at_park(); }, 20000));
+    CHECK_FALSE(driver->get_slewing());
+}
+
+TEST_CASE("SynScan - failed MoveAxis stop retains the manual motion flag", "[synscan][telescope][stop]") {
+    for (int axis : {0, 1}) {
+        CAPTURE(axis);
+        auto st = std::make_shared<FakeSynScanState>();
+        alpacacore::test::FakeMountServer server(synscan_responder(st));
+        REQUIRE(server.ok());
+        auto driver = alpacacore::vendor::synscan::create_synscan_telescope(
+            0, endpoint(server.port(), st), alpacacore::vendor::synscan::SynScanVersion::V4);
+        driver->set_connected(true);
+        REQUIRE_FALSE(driver->get_slewing());
+        driver->move_axis(axis, 0.5);
+        REQUIRE(driver->get_slewing());
+        st->fail_axis_stop.store(true);
+        CHECK_THROWS_AS(driver->move_axis(axis, 0.0), alpacacore::AlpacaException);
+        CHECK(driver->get_slewing());
+        st->fail_axis_stop.store(false);
+        st->muted.store(false);
+        REQUIRE_NOTHROW(driver->move_axis(axis, 0.0));
+        CHECK_FALSE(driver->get_slewing());
+    }
 }
 
 #endif  // !_WIN32

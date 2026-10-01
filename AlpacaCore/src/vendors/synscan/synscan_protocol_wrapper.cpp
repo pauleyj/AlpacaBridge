@@ -434,6 +434,7 @@ public:
     // Tear down the connection. Caller MUST already hold mutex_ (so connect()
     // can reuse it without the non-recursive mutex deadlocking on re-lock).
     void disconnect_locked() {
+        connection_info_.before_send = {};
         if (!connected_) {
             return;
         }
@@ -1130,6 +1131,9 @@ private:
     }
 
     bool write_data(const std::string& data) {
+        if (connection_info_.before_send) {
+            connection_info_.before_send(data);
+        }
         if (connection_type_ == ConnectionType::Serial) {
             return write_serial(data);
         }
