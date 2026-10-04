@@ -1137,7 +1137,8 @@ nlohmann::json WifiManager::save_profile(const std::string& ssid, const std::str
 
     std::optional<std::string> existing_id;
     if (!existing_path.empty()) {
-        existing_id = existing["connection"].value("id", ssid_connection_id(ssid));
+        const auto& connection = existing.at("connection");
+        if (connection.contains("id")) existing_id = connection.at("id").get<std::string>();
     }
     const std::string connection_id = ssid_connection_id(ssid, existing_id);
     Section conn{{"id", SVal::str(connection_id)},

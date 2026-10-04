@@ -107,7 +107,7 @@ represent arbitrary invalid UTF-8 bytes.
   existing secret" when the profile already has one. A secured profile can
   never be silently converted to open — delete and re-add instead.
 - Passphrase must be 8–63 chars when present; SSID is 1–32 bytes.
-- Updating matches by SSID (client profiles only).
+- Updating matches by exact SSID bytes (client profiles only).
 - A new profile uses a safe `Id` as described above. An update keeps the existing
   profile `Id`.
 

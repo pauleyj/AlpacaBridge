@@ -5735,6 +5735,31 @@ int main() {
             const auto json = nlohmann::json::parse(response.body(), nullptr, false);
             EXPECT(!json.is_discarded() && json.value("ErrorNumber", 0) != 0);
         }
+
+        // These invalid passphrases fail before NetworkManager access. A
+        // maximum-length hexadecimal SSID must decode to 32 bytes first;
+        // treating its 64 hex characters as the SSID would fail byte-length
+        // validation instead. Run both profile and AP routes through the same
+        // SsidHex parser.
+        const auto expect_wifi_error = [&](const std::string& path, const std::string& body,
+                                           const std::string& expected) {
+            const auto response = route_request(router, "PUT", path, body);
+            const auto json = nlohmann::json::parse(response.body(), nullptr, false);
+            EXPECT(!json.is_discarded());
+            EXPECT(json.value("ErrorNumber", 0) != 0);
+            EXPECT(json.value("ErrorMessage", std::string{}) == "WiFi: " + expected);
+        };
+        const std::string max_length_hex =
+            nlohmann::json{{"SsidHex", std::string(64, '4')}, {"Passphrase", "x"}}.dump();
+        expect_wifi_error("/management/v1/wifi/profiles", max_length_hex,
+                          "Passphrase must be 8-63 characters (or empty for open networks)");
+        expect_wifi_error("/management/v1/wifi/ap", max_length_hex, "Passphrase must be 8-63 characters");
+
+        for (const auto* path : {"/management/v1/wifi/profiles", "/management/v1/wifi/ap"}) {
+            expect_wifi_error(path, R"({"SsidHex":"gg","Ssid":"ok","Passphrase":"x"})",
+                              "SsidHex must contain only hexadecimal characters");
+            expect_wifi_error(path, R"({"SsidHex":5,"Ssid":"ok","Passphrase":"x"})", "SsidHex (string) is required");
+        }
     }
 
     // Response header names are case-insensitive (RFC 7230 §3.2). The server's
