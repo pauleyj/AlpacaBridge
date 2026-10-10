@@ -69,6 +69,11 @@ std::unique_ptr<alpacacore::CameraDriver> connected_camera(alpacacore::test::Fak
     return camera;
 }
 
+struct ReleaseVideoDataOnExit {
+    alpacacore::test::FakeSVBSDK& sdk;
+    ~ReleaseVideoDataOnExit() { sdk.release_video_data(); }
+};
+
 }  // namespace
 
 TEST_CASE("SVBONY Camera - fake SDK publishes a complete frame", "[svbony][camera][unit]") {
@@ -125,6 +130,78 @@ TEST_CASE("SVBONY Camera - RGB24 channels are reordered for Alpaca", "[svbony][c
     CHECK(image.data[0] == 2);
     CHECK(image.data[1] == 1);
     CHECK(image.data[2] == 0);
+}
+
+TEST_CASE("SVBONY Camera - connect selects only supported default formats", "[svbony][camera][unit]") {
+    using alpacacore::vendor::svbony::SVBImageType;
+
+    SECTION("Y-only format list chooses Y16") {
+        alpacacore::test::FakeSVBSDK sdk;
+        sdk.set_supported_formats({SVBImageType::Y8, SVBImageType::Y16});
+        auto camera = connected_camera(sdk);
+        CHECK(sdk.get_output_image_type(17) == SVBImageType::Y16);
+        camera->set_connected(false);
+        CHECK(sdk.open_count() == 0);
+    }
+
+    SECTION("Y16 is preferred over RGB24") {
+        alpacacore::test::FakeSVBSDK sdk;
+        sdk.set_supported_formats({SVBImageType::Y16, SVBImageType::Rgb24});
+        auto camera = connected_camera(sdk);
+        CHECK(sdk.get_output_image_type(17) == SVBImageType::Y16);
+        camera->set_connected(false);
+        CHECK(sdk.open_count() == 0);
+    }
+
+    SECTION("empty formats refuse connect and balance SDK open") {
+        alpacacore::test::FakeSVBSDK sdk;
+        sdk.set_supported_formats({});
+        auto camera = alpacacore::vendor::svbony::create_svbony_camera(0, 0, sdk);
+        try {
+            camera->set_connected(true);
+            FAIL("Connect should reject an empty supported-format list");
+        } catch (const alpacacore::AlpacaException& ex) {
+            CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+            CHECK(std::string(ex.what()).find("verify this camera is supported") != std::string::npos);
+        }
+        CHECK_FALSE(camera->get_connected());
+        CHECK(sdk.open_count() == 0);
+    }
+
+    SECTION("unsupported-only formats refuse connect and balance SDK open") {
+        alpacacore::test::FakeSVBSDK sdk;
+        sdk.set_supported_formats({SVBImageType::Rgb32});
+        auto camera = alpacacore::vendor::svbony::create_svbony_camera(0, 0, sdk);
+        CHECK_THROWS_AS(camera->set_connected(true), alpacacore::AlpacaException);
+        CHECK_FALSE(camera->get_connected());
+        CHECK(sdk.open_count() == 0);
+    }
+}
+
+TEST_CASE("SVBONY Camera - exposure deadline watchdog reports blocked worker", "[svbony][camera][unit]") {
+    using namespace std::chrono_literals;
+    alpacacore::test::FakeSVBSDK sdk;
+    auto camera = connected_camera(sdk);
+    sdk.block_video_data();
+    ReleaseVideoDataOnExit release{sdk};
+
+    camera->start_exposure(0.001, true);
+    REQUIRE(sdk.wait_for_video_data(2s));
+
+    const auto deadline = std::chrono::steady_clock::now() + 17s;
+    while (std::chrono::steady_clock::now() < deadline && camera->get_camera_state() != alpacacore::CameraState::Idle) {
+        std::this_thread::sleep_for(10ms);
+    }
+    CHECK(camera->get_camera_state() == alpacacore::CameraState::Idle);
+    try {
+        static_cast<void>(camera->get_image_ready());
+        FAIL("ImageReady should surface the watchdog failure");
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::DriverException);
+        CHECK(std::string(ex.what()).find("completion deadline") != std::string::npos);
+    }
+    sdk.release_video_data();
+    camera->stop_exposure();
 }
 
 TEST_CASE("SVBONY Camera - invalid SDK ROI fails and a later exposure recovers", "[svbony][camera][unit]") {

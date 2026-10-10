@@ -434,11 +434,15 @@ public:
             // or the camera is disconnected. This is intentional — we cannot
             // safely cancel a blocked SDK call from outside.
             std::lock_guard<std::mutex> lock(mutex_);
-            if (exposure_deadline_valid_ &&
-                std::chrono::steady_clock::now() >= exposure_deadline_) {
+            // The worker can finish between the optimistic atomic read above
+            // and this lock acquisition. Do not report a stale Exposing state.
+            if (!exposure_active_.load()) {
+                return CameraState::Idle;
+            }
+            if (exposure_deadline_valid_ && std::chrono::steady_clock::now() >= exposure_deadline_) {
                 ALPACA_LOG_WARN("SVBONY",
-                    "Exposure deadline exceeded; forcing CameraState=Idle. "
-                    "Exposure thread may still be blocked inside the SVBONY SDK.");
+                                "Exposure deadline exceeded; forcing CameraState=Idle. "
+                                "Exposure thread may still be blocked inside the SVBONY SDK.");
                 exposure_failure_ = "SVBONY camera exposure exceeded its completion deadline";
                 image_ready_ = false;
                 image_cached_ = false;
@@ -1474,7 +1478,10 @@ private:
                 return;
             }
         }
-        util::throw_invalid_camera_image("SVBONY camera has no supported output format");
+        throw AlpacaException(
+            "SVBONY camera reports no supported image format; verify this camera is supported by the installed SVBONY "
+            "SDK",
+            AlpacaError::DriverException);
     }
 
     static bool is_supported_output_type(SVBImageType type) {

@@ -15,6 +15,7 @@
 #include <alpacacore/version.h>
 
 #include <functional>
+#include <limits>
 
 #include "catch2_compat.h"
 
@@ -100,6 +101,11 @@ TEST_CASE("SVBONY Camera Driver - ASCOM Error Codes", "[svbony][camera][unit]") 
     auto driver = alpacacore::vendor::svbony::create_svbony_camera(0, 0);
 
     require_alpaca_error([&]() { driver->start_exposure(-1.0, true); }, alpacacore::AlpacaError::InvalidValue);
+    require_alpaca_error([&]() { driver->start_exposure(std::numeric_limits<double>::quiet_NaN(), true); },
+                         alpacacore::AlpacaError::InvalidValue);
+    require_alpaca_error([&]() { driver->start_exposure(std::numeric_limits<double>::infinity(), true); },
+                         alpacacore::AlpacaError::InvalidValue);
+    require_alpaca_error([&]() { driver->start_exposure(1e30, true); }, alpacacore::AlpacaError::InvalidValue);
     require_alpaca_error([&]() { driver->get_ccd_temperature(); }, alpacacore::AlpacaError::NotConnected);
     require_alpaca_error([&]() { driver->get_gain(); }, alpacacore::AlpacaError::NotConnected);
     require_alpaca_error([&]() { driver->set_gain(100); }, alpacacore::AlpacaError::NotConnected);

@@ -16,6 +16,8 @@
 #include <alpacacore/vendor/svbony/svbony_sdk_wrapper.h>
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -120,7 +122,10 @@ public:
     }
     void stop_video_capture(int) override {}
     void get_video_data(int, std::uint8_t* buffer, long size, int) override {
-        std::lock_guard lock(mutex_);
+        std::unique_lock lock(mutex_);
+        video_data_entered_ = true;
+        video_data_cv_.notify_all();
+        video_data_cv_.wait(lock, [this] { return !block_video_data_; });
         if (size < 0 || frame_data_.size() < static_cast<std::size_t>(size)) {
             throw alpacacore::AlpacaException("scripted short SVBONY frame", alpacacore::AlpacaError::DriverException);
         }
@@ -146,6 +151,20 @@ public:
     void set_supported_formats(std::vector<ImageType> formats) {
         std::lock_guard lock(mutex_);
         camera_.supported_formats = std::move(formats);
+    }
+    void block_video_data() {
+        std::lock_guard lock(mutex_);
+        block_video_data_ = true;
+        video_data_entered_ = false;
+    }
+    bool wait_for_video_data(std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mutex_);
+        return video_data_cv_.wait_for(lock, timeout, [this] { return video_data_entered_; });
+    }
+    void release_video_data() {
+        std::lock_guard lock(mutex_);
+        block_video_data_ = false;
+        video_data_cv_.notify_all();
     }
     void set_frame_data(std::vector<std::uint8_t> data) {
         std::lock_guard lock(mutex_);
@@ -175,6 +194,9 @@ private:
     std::optional<ImageType> returned_type_;
     std::vector<std::uint8_t> frame_data_;
     bool fail_next_capture_start_{false};
+    std::condition_variable video_data_cv_;
+    bool block_video_data_{false};
+    bool video_data_entered_{false};
     int open_count_{0};
     bool camera_present_{true};
 };
