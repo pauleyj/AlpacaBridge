@@ -88,6 +88,42 @@ TEST_CASE("ZWO fake SDK - lazy download preserves padded ROI pixels", "[zwo][cam
     CHECK(error_code([&] { static_cast<void>(camera->get_image_array()); }) == AlpacaError::InvalidOperation);
 }
 
+TEST_CASE("ZWO fake SDK - odd binned sensor edges preserve client dimensions with zero padding",
+          "[zwo][camera][unit]") {
+    FakeZWOSDK sdk;
+    sdk.camera.max_width = 4144;
+    sdk.camera.max_height = 2822;
+    auto camera = create_zwo_camera(0, sdk.camera.camera_id, sdk);
+    connect_camera(*camera);
+
+    for (const int bin : {2, 3, 4}) {
+        camera->set_bin_x(bin);
+        const int requested_width = sdk.camera.max_width / bin;
+        const int requested_height = sdk.camera.max_height / bin;
+        const int effective_width = requested_width - requested_width % 8;
+        const int effective_height = requested_height - requested_height % 2;
+        sdk.frame_bytes = make_raw16_frame(effective_width, effective_height);
+
+        CHECK(camera->get_num_x() == requested_width);
+        CHECK(camera->get_num_y() == requested_height);
+        camera->start_exposure(0.001, true);
+        REQUIRE(camera->get_image_ready());
+        const auto image = camera->get_image_array();
+        REQUIRE(image.width == requested_width);
+        REQUIRE(image.height == requested_height);
+        CHECK(image.data[0] == 1);
+        const auto last_source_row = static_cast<std::size_t>(effective_height - 1) * requested_width;
+        const auto last_source_pixel = last_source_row + effective_width - 1;
+        CHECK(image.data[last_source_pixel] == effective_width * effective_height);
+        if (effective_width != requested_width) {
+            CHECK(image.data[static_cast<std::size_t>(effective_width - 1)] == 0);
+        }
+        if (effective_height != requested_height) {
+            CHECK(image.data[static_cast<std::size_t>(requested_height - 1) * requested_width] == 0);
+        }
+    }
+}
+
 TEST_CASE("ZWO fake SDK - RGB24 download converts BGR bytes to RGB channels", "[zwo][camera][unit]") {
     FakeZWOSDK sdk;
     sdk.camera.is_color = true;

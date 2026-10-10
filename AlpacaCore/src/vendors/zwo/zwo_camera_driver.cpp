@@ -1159,9 +1159,21 @@ private:
             !supports_format(camera_info_.supported_formats, actual.image_type)) {
             util::throw_invalid_camera_image("ZWO ROI readback does not match the exposure frame");
         }
+        const int max_width = camera_info_.max_width / frame.bin;
+        const int max_height = camera_info_.max_height / frame.bin;
+        const std::int64_t requested_right = static_cast<std::int64_t>(frame.start_x) + frame.crop_x + frame.width;
+        const std::int64_t requested_bottom = static_cast<std::int64_t>(frame.start_y) + frame.crop_y + frame.height;
+        const bool right_edge_padding = requested_right <= max_width &&
+                                        frame.start_x + frame.effective_width == max_width &&
+                                        frame.effective_width == max_width - max_width % 8;
+        const bool bottom_edge_padding = requested_bottom <= max_height &&
+                                         frame.start_y + frame.effective_height == max_height &&
+                                         frame.effective_height == max_height - max_height % 2;
         if (frame.width <= 0 || frame.height <= 0 || frame.crop_x < 0 || frame.crop_y < 0 ||
-            static_cast<std::int64_t>(frame.crop_x) + frame.width > frame.effective_width ||
-            static_cast<std::int64_t>(frame.crop_y) + frame.height > frame.effective_height) {
+            frame.crop_x >= frame.effective_width || frame.crop_y >= frame.effective_height ||
+            requested_right > max_width || requested_bottom > max_height ||
+            (static_cast<std::int64_t>(frame.crop_x) + frame.width > frame.effective_width && !right_edge_padding) ||
+            (static_cast<std::int64_t>(frame.crop_y) + frame.height > frame.effective_height && !bottom_edge_padding)) {
             util::throw_invalid_camera_image("ZWO ROI cannot cover the requested exposure geometry");
         }
     }
@@ -1726,6 +1738,7 @@ private:
                     std::size_t out_base = (static_cast<std::size_t>(row) * static_cast<std::size_t>(out_width) +
                                             static_cast<std::size_t>(col)) *
                                            3;
+                    if (src_row >= frame.effective_height || src_col >= eff_width) continue;
                     const std::size_t src_base =
                         static_cast<std::size_t>(src_row) * buffer_stride + static_cast<std::size_t>(src_col) * 3;
                     // ASI RGB24 frames are delivered BGR; Alpaca channels are RGB.
@@ -1747,6 +1760,7 @@ private:
                                             static_cast<std::size_t>(col);
                     const int src_row = row + frame.crop_y;
                     const int src_col = col + frame.crop_x;
+                    if (src_row >= frame.effective_height || src_col >= eff_width) continue;
                     const std::size_t offset =
                         (static_cast<std::size_t>(src_row) * static_cast<std::size_t>(eff_width) +
                          static_cast<std::size_t>(src_col)) *
@@ -1768,6 +1782,7 @@ private:
                     static_cast<std::size_t>(row) * static_cast<std::size_t>(out_width) + static_cast<std::size_t>(col);
                 const int src_row = row + frame.crop_y;
                 const int src_col = col + frame.crop_x;
+                if (src_row >= frame.effective_height || src_col >= eff_width) continue;
                 const std::size_t buffer_index =
                     static_cast<std::size_t>(src_row) * static_cast<std::size_t>(eff_width) +
                     static_cast<std::size_t>(src_col);

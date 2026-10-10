@@ -56,7 +56,7 @@ public:
         info.max_width = 16;
         info.max_height = 8;
         info.is_color = false;
-        info.supported_bins = {1, 2, 4};
+        info.supported_bins = {1, 2, 3, 4};
         info.supported_formats = {ImageType::Raw16, ImageType::Raw8, ImageType::Y8, ImageType::Rgb24};
         info.pixel_size_um = 3.76;
         info.has_st4_port = true;
