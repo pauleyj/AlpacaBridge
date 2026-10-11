@@ -253,8 +253,11 @@ TEST_CASE("SkyWatcher async - async slew lifecycle lands on target and restores 
     driver->set_connected(false);
 }
 
-TEST_CASE("SkyWatcher async - an ahead landing is held for the sky, not re-goto'd or left ahead (#1019)",
-          "[skywatcher][async]") {
+// open-astro#1019: shared by the northern and southern cases below. The
+// lead's sign follows the hemisphere (landing_lead_seconds_locked()), so
+// each hemisphere needs its own case: the pointing tests judge a landing to
+// 36 s of RA and cannot see a lead read with the wrong sign.
+static void check_ahead_landing_held(double site_latitude, double site_longitude, double site_elevation) {
     // EQM-35 Pro geometry: its gotos cost far less than the 0.5-2.5 s the
     // overhead estimate allows, so every goto lands ahead of the sky. Before
     // #1019 the first slew re-goto'd twice (6 ":S" writes) and every landing
@@ -262,7 +265,8 @@ TEST_CASE("SkyWatcher async - an ahead landing is held for the sky, not re-goto'
     // fell below 6" however many slews warmed the estimates.
     FakeSkyWatcherMount mount(FakeMountProfile::eqm35_pro());
     REQUIRE(mount.ok());
-    auto driver = connected_driver(mount);
+    auto driver = sw::create_skywatcher_telescope(0, endpoint(mount), site_latitude, site_longitude, site_elevation);
+    driver->set_connected(true);
     driver->set_tracking(true);
 
     // ConformU scores a slew by RA difference in arcseconds of RA, with no
@@ -270,14 +274,15 @@ TEST_CASE("SkyWatcher async - an ahead landing is held for the sky, not re-goto'
     auto ra_error_arcsec = [](double actual_ra, double target_ra) {
         return (std::fmod(actual_ra - target_ra + 36.0, 24.0) - 12.0) * 15.0 * 3600.0;
     };
-    const double site_latitude = 39.7392;
     struct Leg {
         double hour_angle;
         double declination;
     };
     // TelescopeSyncTest's start position, then TelescopeSlewTest's
     // SlewToTargetAsync target (ConformU TelescopeTester.cs).
-    const Leg legs[] = {{3.0, 90.0 - (180.0 - site_latitude) * 0.5}, {4.0, 4.0}};
+    // Mirrored below the equator, as ConformU picks them by hemisphere.
+    const double north = site_latitude >= 0.0 ? 1.0 : -1.0;
+    const Leg legs[] = {{3.0, north * (90.0 - (180.0 - std::abs(site_latitude)) * 0.5)}, {4.0, north * 4.0}};
     auto slew = [&](const Leg& leg, int& goto_target_writes) {
         const double target_ra = std::fmod(driver->get_sidereal_time() - leg.hour_angle + 48.0, 24.0);
         const int writes_before = mount.frames_seen('S');
@@ -311,6 +316,16 @@ TEST_CASE("SkyWatcher async - an ahead landing is held for the sky, not re-goto'
     }
     driver->set_tracking(false);
     driver->set_connected(false);
+}
+
+TEST_CASE("SkyWatcher async - an ahead landing is held for the sky, not re-goto'd or left ahead (#1019)",
+          "[skywatcher][async]") {
+    check_ahead_landing_held(39.7392, -104.9903, 1609.0);
+}
+
+TEST_CASE("SkyWatcher async - an ahead landing is held for the sky south of the equator too (#1019)",
+          "[skywatcher][async]") {
+    check_ahead_landing_held(-35.0, 150.0, 80.0);
 }
 
 TEST_CASE("SkyWatcher async - Park completes and Unpark cancels an in-flight park", "[skywatcher][async]") {
