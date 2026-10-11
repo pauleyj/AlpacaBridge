@@ -3981,10 +3981,12 @@ TEST_CASE("SkyWatcher async - a goto landing that reports stopped early is waite
     // slow-deceleration case above still says it does not pin this.
     //
     // The signal is the check's OWN WARN, and it is deterministic. Goto
-    // counts cannot be the signal: refine_goto_landing() burns all three
-    // iterations on this fake whether or not a landing coasts (measured:
-    // 4 Dec gotos either way), so the count is saturated before the coast
-    // can move it. Wall-clock timing cannot be the signal either -- the
+    // counts were not the signal: when this case was written,
+    // refine_goto_landing() burned all three iterations on this fake whether
+    // or not a landing coasted (measured: 4 Dec gotos either way), so the
+    // count was saturated before the coast could move it. Since #1019 a
+    // plain landing takes one goto and a coasting one four, but the WARN
+    // stays the sharper signal. Wall-clock timing cannot be the signal either -- the
     // tracking restore sits between the landing and Slewing clearing (as the
     // 3 s slew_force_until_ window also did before #715), and it swamps a
     // coast short enough to be waited out.
