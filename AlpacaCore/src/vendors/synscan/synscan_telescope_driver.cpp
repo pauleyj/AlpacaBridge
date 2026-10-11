@@ -52,10 +52,11 @@ constexpr double kDefaultGuideRateDegPerSec = 7.5 / 3600.0;
 constexpr double kSiderealDegPerSec = 15.0411 / 3600.0;
 // open-astro#880: a GOTO can land tens of arcseconds off (EQM-35 Pro: 29.4" in RA) and the driver reports the
 // handset's own position afterwards. Refinement re-issues the GOTO until the readback is inside the tolerance,
-// well inside ConformU's +/-10", for at most this many extra passes. A residual still above the failure
-// threshold after the last pass is reported as a slew failure rather than as a success.
+// well inside ConformU's +/-10", for at most this many extra passes. A residual still above the tolerance after
+// the last pass is logged and the slew completes: a handset's own GOTO scatter (EQM-35 Pro on HC 06.03.00: about
+// +/-10" in Dec per GOTO, up to 20", open-astro#1027) is not something another pass can remove, and failing the
+// slew there turned a plate-solvable 15" landing into an error.
 constexpr double kLandingToleranceArcsec = 3.0;
-constexpr double kLandingFailureArcsec = 10.0;
 constexpr int kMaxLandingRefinePasses = 3;
 // A readback this far from the target is not a landing error a fine re-GOTO corrects (a refused or limit-stopped
 // GOTO, a mount that never moved): it is left as it was before refinement existed and logged, not chased.
@@ -2314,8 +2315,8 @@ private:
     // more than kLandingToleranceArcsec, at most kMaxLandingRefinePasses times (open-astro#880). Each pass aims at
     // the target corrected by the residual just read, so a systematic landing offset is cancelled rather than
     // repeated. 16-bit handsets (V3) step ~19.8" in RA, so they are not refined. `lock` is held on entry and on
-    // return. Returns false when the slew was superseded, aborted or cancelled; throws when a pass fails or the
-    // last pass still leaves more than kLandingFailureArcsec.
+    // return. Returns false when the slew was superseded, aborted or cancelled; throws when a pass fails. A
+    // residual left after the last pass is logged as a WARN, not thrown (open-astro#1027).
     bool refine_goto_landing_locked(std::unique_lock<std::mutex>& lock, double ra, double dec,
                                     uint64_t owner_generation, bool async_task) {
         if (!use_precise_commands_) {
@@ -2346,14 +2347,10 @@ private:
                 return true;
             }
             if (pass == kMaxLandingRefinePasses) {
-                const std::string detail = "SynScan GOTO landed " + std::to_string(ra_error_arcsec) +
-                                           " arcsec (RA) and " + std::to_string(dec_error_arcsec) +
-                                           " arcsec (Dec) off target after " + std::to_string(kMaxLandingRefinePasses) +
-                                           " refinement passes";
-                if (ra_error_arcsec > kLandingFailureArcsec || dec_error_arcsec > kLandingFailureArcsec) {
-                    throw AlpacaException(detail, AlpacaError::DriverException);
-                }
-                ALPACA_LOG_WARN("SynScan", detail);
+                ALPACA_LOG_WARN("SynScan", "SynScan GOTO landed " + std::to_string(ra_error_arcsec) +
+                                               " arcsec (RA) and " + std::to_string(dec_error_arcsec) +
+                                               " arcsec (Dec) off target after " +
+                                               std::to_string(kMaxLandingRefinePasses) + " refinement passes");
                 return true;
             }
             aim_ra = std::fmod(aim_ra + ra_error_hours + 24.0, 24.0);
