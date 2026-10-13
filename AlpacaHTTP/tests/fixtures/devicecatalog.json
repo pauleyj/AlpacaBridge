@@ -44,7 +44,7 @@
     "available": true,
     "buildOption": "ALPACACORE_ENABLE_CELESTRON",
     "fields": [
-      {"key": "protocol", "type": "string", "default": "nexstar", "required": false, "secret": false, "role": "Discriminator", "enum": ["nexstar", "cgx-aux"]},
+      {"key": "protocol", "type": "string", "default": "nexstar", "required": false, "secret": false, "role": "Discriminator", "enum": ["nexstar", "cgx-aux", "nexstar-aux"]},
       {"key": "connectionType", "type": "string", "default": "auto", "required": false, "secret": false, "role": "Discriminator"},
       {"key": "mountIndex", "type": "int", "default": 0, "required": false, "secret": false, "role": "EnumerationIndex"},
       {"key": "portPath", "type": "string", "default": "", "required": false, "secret": false, "role": "PortPath", "appliesWhen": {"key": "connectionType", "value": "serial"}},

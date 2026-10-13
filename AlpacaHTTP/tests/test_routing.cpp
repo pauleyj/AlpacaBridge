@@ -5081,6 +5081,13 @@ int main() {
             R"({"protocol":"cgx-aux","connectionType":"serial","portPath":"/dev/ttyUSB-cgx",)"
             R"("siteLatitude":-33.87,"siteLongitude":151.21,"siteElevation":0.0,)"
             R"("apertureDiameter":0.2,"focalLength":1.0})");
+        add("celestron", "telescope", "Telescope", "nexstar-aux SkyPortal",
+            R"({"protocol":"nexstar-aux","connectionType":"network","host":"192.0.2.1","tcpPort":2000,"responseTimeoutMs":1500,)"
+            R"("siteLatitude":45.0,"siteLongitude":0.0,"siteElevation":12.0,)"
+            R"("apertureDiameter":0.2,"focalLength":1.0,"alignmentMode":"equatorial"})",
+            R"({"protocol":"nexstar-aux","connectionType":"network","host":"192.0.2.1","tcpPort":2000,"responseTimeoutMs":1500,)"
+            R"("siteLatitude":45.0,"siteLongitude":0.0,"siteElevation":12.0,)"
+            R"("apertureDiameter":0.2,"focalLength":1.0,"alignmentMode":"equatorial"})");
         // #860: a known alignmentMode survives; an unknown string or a non-string drops.
         add("celestron", "telescope", "Telescope", "alignmentMode auto",
             R"({"connectionType":"auto","mountIndex":1,"alignmentMode":"auto"})",

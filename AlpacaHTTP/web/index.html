@@ -565,6 +565,7 @@
                         <select id="celestron-protocol" name="celestronProtocol" required>
                             <option value="nexstar">NexStar hand controller</option>
                             <option value="cgx-aux">CGX / CGX-L direct USB (no hand controller)</option>
+                            <option value="nexstar-aux">Celestron AUX over SkyPortal WiFi (experimental CGX status-only)</option>
                         </select>
                     </div>
 
@@ -603,7 +604,8 @@
                     </div>
 
                     <div id="celestron-cgx-site-config" style="display: none;">
-                        <h4>Direct USB Site</h4>
+                        <h4>Direct AUX Site</h4>
+                        <small>SkyPortal AUX currently verifies a stopped northern CGX and reports status only. Pointing, tracking control, guiding and Park are not enabled yet. Disable competing apps and hand-controller tracking before connecting.</small>
                         <div class="form-group">
                             <label for="celestron-cgx-site-latitude">Site Latitude (degrees):</label>
                             <input type="number" id="celestron-cgx-site-latitude" name="celestronSiteLatitude"
@@ -631,6 +633,11 @@
                             <label for="celestron-tcp-port">TCP Port:</label>
                             <input type="number" id="celestron-tcp-port" name="celestronTcpPort" value="2000" min="1" max="65535">
                             <small>Default port for NexStar WiFi bridges.</small>
+                        </div>
+                        <div class="form-group" id="celestron-aux-timeout-group" style="display: none;">
+                            <label for="celestron-aux-timeout">AUX Response Timeout (ms):</label>
+                            <input type="number" id="celestron-aux-timeout" name="celestronAuxResponseTimeoutMs" value="5000" min="1" max="5000" step="1">
+                            <small>Allows fragmented SkyPortal replies. Overall Connect and polling deadlines also apply.</small>
                         </div>
                     </div>
 

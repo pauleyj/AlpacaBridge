@@ -23,6 +23,8 @@
 // endpoint is warned about and kept. An unknown alignmentMode is dropped from
 // either source and reads as "auto" (#860).
 
+#include <arpa/inet.h>
+
 #include <string>
 
 #include "../../catalog/builtin_descriptors.h"
@@ -49,6 +51,38 @@ NormalizeResult normalize_celestron(const DeviceConfig& in, Source source) {
 
     const std::string protocol = result.config.get(kCelestronProtocol);
     std::string type = in.get(kCelestronConnectionType);
+    if (protocol == "nexstar-aux") {
+        const auto refuse = [&](const std::string& message) {
+            if (from_api)
+                result.rejection = message;
+            else
+                result.warnings.push_back(message);
+        };
+        if (type != "network") {
+            refuse("SkyPortal AUX requires Connection Type 'network' and an explicit numeric IP address");
+            if (from_api) return result;
+            // Keep the AUX backend, but invalidate its endpoint rather than selecting HC/serial.
+            result.config.set(kCelestronHost.key, std::string{});
+            result.config.set(kCelestronConnectionType.key, std::string{"network"});
+        }
+        const auto host = in.get(kCelestronHost);
+        const auto port = in.get(kCelestronTcpPort);
+        in6_addr parsed{};
+        if (host.empty() || host.size() > INET6_ADDRSTRLEN || host.find('\0') != std::string::npos ||
+            (::inet_pton(AF_INET, host.c_str(), &parsed) != 1 && ::inet_pton(AF_INET6, host.c_str(), &parsed) != 1)) {
+            refuse("SkyPortal AUX host must be a numeric IPv4 or IPv6 address");
+        }
+        if (port < 1 || port > 65535) refuse("SkyPortal AUX TCP port must be between 1 and 65535");
+        const auto timeout = in.get(kCelestronResponseTimeoutMs);
+        if (timeout < 1 || timeout > 5000) refuse("SkyPortal AUX responseTimeoutMs must be between 1 and 5000");
+        if (!in.find(kCelestronSiteLatitude) || !in.find(kCelestronSiteLongitude))
+            refuse("SkyPortal AUX requires SiteLatitude and SiteLongitude");
+        if (in.get(kCelestronAlignmentMode) == "altaz") {
+            refuse("SkyPortal AUX currently supports an equatorial CGX only");
+            if (!from_api) result.config.set(kCelestronHost.key, std::string{});
+        }
+        return result;
+    }
     if (protocol == "cgx-aux" && type != "serial") {
         if (from_api) {
             result.rejection = "Celestron CGX AUX requires Connection Type 'serial' and a USB port path";

@@ -65,6 +65,7 @@
 #include <alpacacore/vendor/celestron/celestron_telescope_driver.h>
 
 #include "fake_celestron_cgx_mount.h"
+#include "fake_celestron_aux_server.h"
 #endif
 #ifdef ALPACACORE_ENABLE_SYNSCAN
 #include <alpacacore/vendor/synscan/synscan_protocol_wrapper.h>
@@ -878,6 +879,33 @@ Tier2Host tier2_host_celestron_cgx_telescope() {
         err::InvalidOperation};
     return host;
 }
+Tier2Host tier2_host_celestron_nexstar_aux_telescope() {
+    namespace cel = alpacacore::vendor::celestron;
+    const auto make = [](const auto& fake) -> std::unique_ptr<AlpacaDriver> {
+        cel::NexStarAuxConnectionInfo info;
+        info.host = "127.0.0.1";
+        info.tcp_port = fake->port();
+        info.site_latitude = 45.0;
+        info.site_longitude = -75.0;
+        return cel::create_celestron_nexstar_aux_telescope(0, info);
+    };
+    Tier2Host host{"celestron_telescope_nexstar_aux", "celestron", "telescope", "fake_celestron_aux_server.h",
+                  DeviceType::Telescope, "celestron_telescope_nexstar_aux", {}, false, {}, "",
+                  "Connect verifies stationary encoder samples over 250 ms; no held reply is injected in this profile",
+                  err::InvalidOperation};
+    host.connectable = [make](bool) -> Hosted {
+        auto fake = std::make_shared<alpacacore::test::FakeCelestronAuxServer>();
+        fake->enable_cgx_profile();
+        return {fake, make(fake)};
+    };
+    host.failing = [make]() -> Hosted {
+        auto fake = std::make_shared<alpacacore::test::FakeCelestronAuxServer>();
+        fake->enable_cgx_profile();
+        fake->set_model(24);
+        return {fake, make(fake)};
+    };
+    return host;
+}
 #endif
 
 #ifdef ALPACACORE_ENABLE_SYNSCAN
@@ -1504,7 +1532,7 @@ Tier2Host tier2_host_wandererastro_switch() {
 #define CS2_ZWO(X)
 #endif
 #ifdef ALPACACORE_ENABLE_CELESTRON
-#define CS2_CELESTRON(X) X(celestron_telescope, TEL) X(celestron_cgx_telescope, TEL)
+#define CS2_CELESTRON(X) X(celestron_telescope, TEL) X(celestron_cgx_telescope, TEL) X(celestron_nexstar_aux_telescope, TEL)
 #else
 #define CS2_CELESTRON(X)
 #endif

@@ -49,7 +49,7 @@ test('Celestron protocol picker distinguishes the handset and direct CGX USB tra
         /<select id="celestron-protocol"[^>]*name="celestronProtocol"[^>]*>([\s\S]*?)<\/select>/);
     assert.ok(select, 'no Celestron protocol selector');
     const values = [...select[1].matchAll(/<option value="([^"]+)"/g)].map((m) => m[1]);
-    assert.deepEqual(values, ['nexstar', 'cgx-aux']);
+    assert.deepEqual(values, ['nexstar', 'cgx-aux', 'nexstar-aux']);
     assert.ok(html.includes('CGX / CGX-L direct USB (no hand controller)'));
     assert.ok(html.includes('id="celestron-cgx-site-latitude"'));
     assert.ok(html.includes('id="celestron-cgx-site-longitude"'));
@@ -67,6 +67,16 @@ test('Celestron direct USB config persists protocol and uses the fixed serial tr
 test('Celestron visibility is recalculated whenever its form section is reselected', () => {
     assert.match(app, /vendor === 'celestron'\) \{\s*document\.getElementById\('celestron-config'\)\.style\.display = 'block';\s*updateCelestronConnectionFields\(\);/);
     assert.match(app, /function resetDeviceForm\(\)[\s\S]*?updateVendorOptions\(\);/);
+});
+
+test('SkyPortal AUX uses network and shares the saved site fields', () => {
+    assert.ok(html.includes('value="nexstar-aux"'));
+    assert.ok(html.includes('experimental CGX status-only'));
+    assert.ok(app.includes("if (skyPortal && celestronConnectionType) celestronConnectionType.value = 'network';"));
+    assert.ok(app.includes("if (cgxSite) cgxSite.style.display = directUsb || skyPortal ? 'block' : 'none';"));
+    assert.ok(app.includes("deviceData.protocol === 'nexstar-aux' ? 'network'"));
+    assert.ok(app.includes("deviceData.protocol === 'cgx-aux' || deviceData.protocol === 'nexstar-aux'"));
+    assert.ok(app.includes("if (deviceData.protocol === 'nexstar-aux') deviceData.alignmentMode = 'equatorial';"));
 });
 
 test('known alignment modes pass through', () => {

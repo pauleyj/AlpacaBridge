@@ -32,7 +32,7 @@
 
 namespace alpacacore::catalog {
 
-inline constexpr const char* kCelestronProtocols[] = {"nexstar", "cgx-aux"};
+inline constexpr const char* kCelestronProtocols[] = {"nexstar", "cgx-aux", "nexstar-aux"};
 
 inline const Field<std::string> kCelestronProtocol{
     .key = "protocol", .default_value = "nexstar", .role = Role::Discriminator, .allowed_values = kCelestronProtocols};

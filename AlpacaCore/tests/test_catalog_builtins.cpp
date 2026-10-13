@@ -1828,6 +1828,41 @@ TEST_CASE("Builtin catalog - Celestron CGX AUX protocol requires explicit serial
     CHECK_FALSE(persisted.warnings.empty());
 }
 
+TEST_CASE("Builtin catalog - SkyPortal AUX selects network and preserves invalid persisted entries",
+          "[catalog][celestron][unit]") {
+    const DeviceCatalog catalog = builtin_catalog();
+    DeviceConfig config;
+    config.set("protocol", std::string{"nexstar-aux"});
+    config.set("connectionType", std::string{"network"});
+    config.set("host", std::string{"127.0.0.1"});
+    config.set("siteLatitude", 0.0);
+    config.set("siteLongitude", 0.0);
+    const auto valid = catalog.normalize(kCelestronKey, config, Source::Api);
+    CHECK_FALSE(valid.rejection);
+#ifdef ALPACACORE_ENABLE_CELESTRON
+    auto driver = catalog.create(kCelestronKey, valid.config, 8);
+    CHECK(driver->get_description() == "Celestron CGX SkyPortal AUX mount (lifecycle-only profile)");
+    CHECK_FALSE(driver->get_connected());
+#endif
+    config.set("connectionType", std::string{"serial"});
+    CHECK(catalog.normalize(kCelestronKey, config, Source::Api).rejection);
+    const auto saved = catalog.normalize(kCelestronKey, config, Source::Persisted);
+    CHECK_FALSE(saved.rejection);
+    CHECK_FALSE(saved.warnings.empty());
+    CHECK(std::get<std::string>(*saved.config.find_value("protocol")) == "nexstar-aux");
+    CHECK(std::get<std::string>(*saved.config.find_value("connectionType")) == "network");
+    CHECK(std::get<std::string>(*saved.config.find_value("host")).empty());
+    config.set("connectionType", std::string{"network"});
+    config.set("host", std::string{"localhost"});
+    CHECK(catalog.normalize(kCelestronKey, config, Source::Api).rejection);
+    config.set("host", std::string{"127.0.0.1"});
+    config.set("tcpPort", std::int64_t{65536});
+    CHECK(catalog.normalize(kCelestronKey, config, Source::Api).rejection);
+    config.set("tcpPort", std::int64_t{2000});
+    config.erase("siteLatitude");
+    CHECK(catalog.normalize(kCelestronKey, config, Source::Api).rejection);
+}
+
 TEST_CASE("Builtin catalog - Celestron alignmentMode keeps a known value and drops an unknown one (#860)",
           "[catalog][celestron][unit]") {
     DeviceCatalog catalog;

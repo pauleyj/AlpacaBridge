@@ -19,6 +19,7 @@
 // explicit serial USB port and site coordinates.
 
 #include <alpacacore/vendor/celestron/celestron_cgx_telescope_driver.h>
+#include <alpacacore/vendor/celestron/celestron_nexstar_aux_telescope_driver.h>
 #include <alpacacore/vendor/celestron/celestron_telescope_driver.h>
 
 #include <optional>
@@ -60,6 +61,19 @@ void register_celestron_factory(DeviceCatalog& catalog) {
             info.aperture_diameter_meters = config.get(kCelestronApertureDiameter);
             info.focal_length_meters = config.get(kCelestronFocalLength);
             telescope = vendor::celestron::create_celestron_cgx_telescope(device_number, info);
+        } else if (protocol == "nexstar-aux") {
+            vendor::celestron::NexStarAuxConnectionInfo info;
+            info.host = config.get(kCelestronHost);
+            const auto port = config.get(kCelestronTcpPort);
+            // Invalid persisted endpoints remain visible and refuse Connect; never narrow/wrap the port.
+            info.tcp_port = port >= 1 && port <= 65535 ? static_cast<int>(port) : 0;
+            info.response_timeout = std::chrono::milliseconds(config.get(kCelestronResponseTimeoutMs));
+            info.site_latitude = latitude;
+            info.site_longitude = longitude;
+            info.site_elevation = elevation.value_or(0.0);
+            info.aperture_diameter = config.get(kCelestronApertureDiameter);
+            info.focal_length = config.get(kCelestronFocalLength);
+            telescope = vendor::celestron::create_celestron_nexstar_aux_telescope(device_number, info);
         } else if (type.empty() || type == "auto") {
             const int mount_index = static_cast<int>(config.get(kCelestronMountIndex));
             telescope = vendor::celestron::create_celestron_telescope_auto(device_number, mount_index, latitude,
@@ -82,7 +96,7 @@ void register_celestron_factory(DeviceCatalog& catalog) {
                 device_number, info, latitude, longitude, elevation, sync_time, alignment);
         }
 
-        if (protocol != "cgx-aux") {
+        if (protocol == "nexstar") {
             if (const double aperture = config.get(kCelestronApertureDiameter); aperture > 0.0) {
                 telescope->set_aperture_diameter(aperture);
             }

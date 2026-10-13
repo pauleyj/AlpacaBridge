@@ -8,8 +8,10 @@ if(ALPACACORE_ENABLE_CELESTRON)
     set(CELESTRON_SOURCES
         celestron_cgx_geometry.cpp
         celestron_cgx_protocol.cpp
+        celestron_aux_link.cpp
         celestron_cgx_protocol_wrapper.cpp
         celestron_cgx_telescope_driver.cpp
+        celestron_nexstar_aux_telescope_driver.cpp
         celestron_protocol_wrapper.cpp
         celestron_telescope_driver.cpp
         celestron_catalog.cpp

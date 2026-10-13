@@ -15,6 +15,7 @@
 #include <alpacacore/util/serial_by_id_scan.h>
 #include <alpacacore/util/serial_io.h>
 #include <alpacacore/util/serial_port_registry.h>
+#include <alpacacore/vendor/celestron/celestron_endpoint_claim.h>
 #include <alpacacore/vendor/celestron/celestron_protocol_wrapper.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -1482,6 +1483,9 @@ private:
 
     bool connect_network(const std::string& host, int port) {
         constexpr int kConnectTimeoutMs = 7000;
+        if (port < 1 || port > 65535) {
+            throw AlpacaException("Celestron TCP port must be between 1 and 65535", AlpacaError::InvalidValue);
+        }
         socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (socket_fd_ < 0) {
             return false;
@@ -1503,19 +1507,23 @@ private:
             addr.sin_addr = reinterpret_cast<sockaddr_in*>(result->ai_addr)->sin_addr;
             freeaddrinfo(result);
         }
+        try {
+            endpoint_claim_.claim(reinterpret_cast<const sockaddr*>(&addr), port);
+        } catch (...) {
+            disconnect_network();
+            throw;
+        }
         // Non-blocking connect with a bounded poll timeout: this runs under the
         // driver mutex, and a bare blocking connect() to an unreachable host
         // would stall every GET (and disconnect) for the full OS TCP timeout
         // (~127 s). Same pattern as the iOptron network prober.
         if (!util::set_nonblocking(socket_fd_)) {
-            close(socket_fd_);
-            socket_fd_ = -1;
+            disconnect_network();
             return false;
         }
         int rc = ::connect(socket_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
         if (rc < 0 && errno != EINPROGRESS) {
-            close(socket_fd_);
-            socket_fd_ = -1;
+            disconnect_network();
             return false;
         }
         if (rc < 0) {
@@ -1526,16 +1534,14 @@ private:
             int sock_err = 0;
             socklen_t len = sizeof(sock_err);
             if (poll_rc <= 0 || getsockopt(socket_fd_, SOL_SOCKET, SO_ERROR, &sock_err, &len) != 0 || sock_err != 0) {
-                close(socket_fd_);
-                socket_fd_ = -1;
+                disconnect_network();
                 return false;
             }
         }
         // Restore blocking mode for the synchronous request/response I/O below;
         // a stuck-non-blocking fd would make every recv spin with EAGAIN.
         if (!util::clear_nonblocking(socket_fd_)) {
-            close(socket_fd_);
-            socket_fd_ = -1;
+            disconnect_network();
             return false;
         }
         configure_network_timeouts();
@@ -1554,6 +1560,7 @@ private:
             close(socket_fd_);
             socket_fd_ = -1;
         }
+        endpoint_claim_.release();
     }
 
     bool write_data(const std::string& data) {
@@ -1686,6 +1693,7 @@ private:
     int serial_fd_;
     int socket_fd_;
     std::string serial_registry_path_;
+    CelestronEndpointClaim endpoint_claim_;
 };
 
 CelestronProtocolWrapper::CelestronProtocolWrapper() : pimpl_(std::make_unique<Impl>()) {}

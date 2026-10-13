@@ -955,7 +955,8 @@ function startEditDevice(device) {
         const protocol = config.protocol || 'nexstar';
         setFormValue('celestron-protocol', protocol);
         setFormValue('celestron-alignment-mode', normalizeAlignmentMode(config.alignmentMode));
-        const celestronConnectionType = protocol === 'cgx-aux' ? 'serial' : (config.connectionType || 'auto');
+        const celestronConnectionType = protocol === 'cgx-aux' ? 'serial'
+            : protocol === 'nexstar-aux' ? 'network' : (config.connectionType || 'auto');
         setFormValue('celestron-connection-type', celestronConnectionType);
         if (celestronConnectionType === 'serial') {
             setFormValue('celestron-port-path', config.portPath);
@@ -971,6 +972,7 @@ function startEditDevice(device) {
         setFormValue('celestron-cgx-site-latitude', config.siteLatitude);
         setFormValue('celestron-cgx-site-longitude', config.siteLongitude);
         setFormValue('celestron-cgx-site-elevation', config.siteElevation);
+        setFormValue('celestron-aux-timeout', config.responseTimeoutMs ?? 5000);
         const celestronProtocolEl = document.getElementById('celestron-protocol');
         if (celestronProtocolEl) {
             celestronProtocolEl.dispatchEvent(new Event('change'));
@@ -3172,11 +3174,15 @@ const celestronConnectionType = document.getElementById('celestron-connection-ty
 const celestronProtocol = document.getElementById('celestron-protocol');
 function updateCelestronConnectionFields() {
     const directUsb = celestronProtocol && celestronProtocol.value === 'cgx-aux';
+    const skyPortal = celestronProtocol && celestronProtocol.value === 'nexstar-aux';
     const nexstarOnly = document.getElementById('celestron-nexstar-only');
-    if (nexstarOnly) nexstarOnly.style.display = directUsb ? 'none' : 'block';
+    if (nexstarOnly) nexstarOnly.style.display = directUsb || skyPortal ? 'none' : 'block';
     const cgxSite = document.getElementById('celestron-cgx-site-config');
-    if (cgxSite) cgxSite.style.display = directUsb ? 'block' : 'none';
+    if (cgxSite) cgxSite.style.display = directUsb || skyPortal ? 'block' : 'none';
     if (directUsb && celestronConnectionType) celestronConnectionType.value = 'serial';
+    if (skyPortal && celestronConnectionType) celestronConnectionType.value = 'network';
+    const auxTimeout = document.getElementById('celestron-aux-timeout-group');
+    if (auxTimeout) auxTimeout.style.display = skyPortal ? 'block' : 'none';
     const type = directUsb ? 'serial' : (celestronConnectionType ? celestronConnectionType.value : 'auto');
     document.getElementById('celestron-serial-config').style.display = type === 'serial' ? 'block' : 'none';
     document.getElementById('celestron-network-config').style.display = type === 'network' ? 'block' : 'none';
@@ -4051,8 +4057,16 @@ document.getElementById('device-form').addEventListener('submit', async function
         deviceData.protocol = formData.get('celestronProtocol') || 'nexstar';
         deviceData.connectionType = deviceData.protocol === 'cgx-aux'
             ? 'serial'
-            : (formData.get('celestronConnectionType') || 'auto');
+            : deviceData.protocol === 'nexstar-aux' ? 'network' : (formData.get('celestronConnectionType') || 'auto');
         deviceData.alignmentMode = normalizeAlignmentMode(formData.get('celestronAlignmentMode'));
+        if (deviceData.protocol === 'nexstar-aux') deviceData.alignmentMode = 'equatorial';
+        if (deviceData.protocol === 'nexstar-aux') {
+            deviceData.responseTimeoutMs = Number(formData.get('celestronAuxResponseTimeoutMs'));
+            if (!Number.isInteger(deviceData.responseTimeoutMs) || deviceData.responseTimeoutMs < 1 || deviceData.responseTimeoutMs > 5000) {
+                alert('SkyPortal AUX response timeout must be an integer between 1 and 5000 ms.');
+                return;
+            }
+        }
         if (deviceData.connectionType === 'serial') {
             deviceData.portPath = formData.get('celestronPortPath');
             if (deviceData.protocol !== 'cgx-aux') {
@@ -4060,13 +4074,21 @@ document.getElementById('device-form').addEventListener('submit', async function
             }
         } else if (deviceData.connectionType === 'network') {
             deviceData.host = formData.get('celestronHost');
-            deviceData.tcpPort = parseInt(formData.get('celestronTcpPort')) || 2000;
+            deviceData.tcpPort = deviceData.protocol === 'nexstar-aux'
+                ? Number(formData.get('celestronTcpPort')) : (parseInt(formData.get('celestronTcpPort')) || 2000);
+            if (deviceData.protocol === 'nexstar-aux' &&
+                (!Number.isInteger(deviceData.tcpPort) || deviceData.tcpPort < 1 || deviceData.tcpPort > 65535)) {
+                alert('Celestron TCP port must be an integer between 1 and 65535.');
+                return;
+            }
         }
-        if (deviceData.protocol === 'cgx-aux') {
+        if (deviceData.protocol === 'cgx-aux' || deviceData.protocol === 'nexstar-aux') {
             const latitude = readOptionalNumber(formData, 'celestronSiteLatitude');
             const longitude = readOptionalNumber(formData, 'celestronSiteLongitude');
             if (latitude === null || longitude === null) {
-                alert('Site latitude and longitude are required for direct CGX USB. Enter both coordinates to identify the hemisphere and calculate pointing.');
+                alert(deviceData.protocol === 'cgx-aux'
+                    ? 'Site latitude and longitude are required for direct CGX USB. Enter both coordinates to identify the hemisphere and calculate pointing.'
+                    : 'Site latitude and longitude are required for SkyPortal AUX.');
                 return;
             }
             deviceData.siteLatitude = latitude;
