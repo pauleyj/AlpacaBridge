@@ -10,6 +10,7 @@
 // license text and the vendor-SDK linking exception, or the license online at:
 // https://www.gnu.org/licenses/agpl-3.0.html
 
+#include <alpacacore/vendor/celestron/celestron_aux_link.h>
 #include <alpacacore/vendor/celestron/celestron_nexstar_aux_telescope_driver.h>
 #include <alpacacore/version.h>
 
@@ -43,6 +44,22 @@ void error_code(F&& action, int code) {
     } catch (const AlpacaException& error) {
         CHECK(error.error_code() == code);
     }
+}
+void refused_identity(test::FakeCelestronAuxServer& fake) {
+    auto driver = create_celestron_nexstar_aux_telescope(0, info(fake.port()));
+    error_code([&] { driver->set_connected(true); }, AlpacaError::DriverException);
+    CHECK_FALSE(driver->get_connected());
+    CHECK_FALSE(driver->get_device_firmware());
+    CHECK(driver->get_device_state().empty());
+    const auto requests = fake.requests();
+    CHECK(std::all_of(requests.begin(), requests.end(), [](const auto& frame) {
+        return frame.source == 0x20 && (frame.destination == 0x10 || frame.destination == 0x11) &&
+               (frame.command == 0xfe || frame.command == 0x05) && frame.payload.empty();
+    }));
+    // A new live exchange proves the refused driver closed the socket and released its claim.
+    CelestronAuxLink replacement;
+    CHECK_NOTHROW(replacement.connect_tcp("127.0.0.1", fake.port(), 500ms));
+    CHECK_NOTHROW(replacement.exchange({0x20, 0x10, 0xfe, {}}, 500ms));
 }
 void transition(TelescopeDriver& driver, test::FakeTaskClock& clock, bool connected) {
     const auto waits = clock.wait_count();
@@ -140,14 +157,17 @@ TEST_CASE("Celestron SkyPortal AUX Driver - Connect stops both axes and getters 
     VirtualDisconnect cleanup{*driver, clock};
     transition(*driver, clock, true);
     CHECK(driver->get_connected());
-    CHECK(driver->get_device_firmware() == std::optional<std::string>{"RA 7.18, Dec 7.18"});
+    CHECK(driver->get_device_firmware() == std::optional<std::string>{"RA 7.17.25, Dec 7.17.25"});
     const auto requests = fake.requests();
-    REQUIRE(requests.size() >= 19);
+    REQUIRE(requests.size() >= 20);
     CHECK(requests[2].command == 0x05);
-    CHECK(requests[5].command == 0x24);
-    CHECK(requests[5].destination == 0x10);
+    CHECK(requests[2].destination == 0x10);
+    CHECK(requests[3].command == 0x05);
+    CHECK(requests[3].destination == 0x11);
     CHECK(requests[6].command == 0x24);
-    CHECK(requests[6].destination == 0x11);
+    CHECK(requests[6].destination == 0x10);
+    CHECK(requests[7].command == 0x24);
+    CHECK(requests[7].destination == 0x11);
     CHECK_FALSE(driver->get_tracking());
     CHECK_FALSE(driver->get_slewing());
     CHECK_FALSE(driver->get_is_pulse_guiding());
@@ -213,10 +233,109 @@ TEST_CASE("Celestron SkyPortal AUX Driver - Refused identity leaves no endpoint 
     error_code([&] { driver->set_connected(true); }, AlpacaError::DriverException);
     CHECK_FALSE(driver->get_connected());
     CHECK_FALSE(driver->get_device_firmware());
-    fake.set_model(23);
+    fake.set_model(0x1788);
     auto replacement = create_celestron_nexstar_aux_telescope(1, info(fake.port()));
     CHECK_NOTHROW(replacement->set_connected(true));
     CHECK(replacement->get_connected());
+}
+
+TEST_CASE("Celestron SkyPortal AUX Driver - Modern firmware decodes the big-endian build",
+          "[celestron][nexstar-aux][telescope]") {
+    test::FakeCelestronAuxServer fake;
+    REQUIRE(fake.ok());
+    fake.enable_cgx_profile();
+    for (const auto axis : {CgxAxis::RightAscension, CgxAxis::Declination})
+        fake.set_firmware(axis, {7, 17, 0x12, 0x34});
+    test::FakeTaskClock clock;
+    auto driver = create_celestron_nexstar_aux_telescope(0, info(fake.port()), clock);
+    VirtualDisconnect cleanup{*driver, clock};
+    transition(*driver, clock, true);
+    CHECK(driver->get_device_firmware() == std::optional<std::string>{"RA 7.17.4660, Dec 7.17.4660"});
+    const auto requests = fake.requests();
+    REQUIRE(requests.size() >= 6);
+    for (std::size_t i = 0; i < 4; ++i) {
+        CHECK(requests[i].source == 0x20);
+        CHECK(requests[i].destination == (i % 2 == 0 ? 0x10 : 0x11));
+        CHECK(requests[i].command == (i < 2 ? 0xfe : 0x05));
+        CHECK(requests[i].payload.empty());
+    }
+    CHECK(std::none_of(requests.begin(), requests.end(),
+                       [](const auto& frame) { return frame.destination == 0x30 || frame.destination == 0x31; }));
+    CHECK_FALSE(driver->get_can_slew_async());
+    CHECK_FALSE(driver->get_can_set_tracking());
+    CHECK_FALSE(driver->get_can_pulse_guide());
+}
+
+TEST_CASE("Celestron SkyPortal AUX Driver - Malformed and mixed firmware identities refuse before takeover",
+          "[celestron][nexstar-aux][telescope]") {
+    for (const auto axis : {CgxAxis::RightAscension, CgxAxis::Declination}) {
+        for (const auto& reply :
+             std::vector<std::vector<std::uint8_t>>{{}, {7}, {7, 17}, {7, 17, 0}, {7, 17, 0, 25, 0}}) {
+            INFO("axis=" << static_cast<int>(axis) << ", firmware length=" << reply.size());
+            test::FakeCelestronAuxServer fake;
+            REQUIRE(fake.ok());
+            fake.enable_cgx_profile();
+            fake.set_firmware(axis, reply);
+            refused_identity(fake);
+        }
+    }
+    SECTION("both motors using the legacy shape remain unqualified") {
+        test::FakeCelestronAuxServer fake;
+        REQUIRE(fake.ok());
+        fake.enable_cgx_profile();
+        for (const auto axis : {CgxAxis::RightAscension, CgxAxis::Declination}) {
+            fake.set_firmware(axis, {7, 18});
+            fake.set_model(axis, {23});
+        }
+        refused_identity(fake);
+    }
+    SECTION("matching oversized firmware is malformed, not a new profile") {
+        test::FakeCelestronAuxServer fake;
+        REQUIRE(fake.ok());
+        fake.enable_cgx_profile();
+        for (const auto axis : {CgxAxis::RightAscension, CgxAxis::Declination})
+            fake.set_firmware(axis, {7, 17, 0, 25, 0});
+        refused_identity(fake);
+    }
+}
+
+TEST_CASE("Celestron SkyPortal AUX Driver - Mismatched and old firmware identities refuse before takeover",
+          "[celestron][nexstar-aux][telescope]") {
+    for (const auto axis : {CgxAxis::RightAscension, CgxAxis::Declination}) {
+        for (const auto& reply : std::vector<std::vector<std::uint8_t>>{
+                 {8, 17, 0, 25}, {7, 18, 0, 25}, {7, 17, 1, 25}, {7, 17, 0, 26}, {6, 49, 0, 25}}) {
+            INFO("axis=" << static_cast<int>(axis) << ", firmware=" << static_cast<int>(reply[0]) << "."
+                         << static_cast<int>(reply[1]) << "." << static_cast<int>(reply[2]) << "."
+                         << static_cast<int>(reply[3]));
+            test::FakeCelestronAuxServer fake;
+            REQUIRE(fake.ok());
+            fake.enable_cgx_profile();
+            fake.set_firmware(axis, reply);
+            refused_identity(fake);
+        }
+    }
+    SECTION("matching old firmware is still refused") {
+        test::FakeCelestronAuxServer fake;
+        REQUIRE(fake.ok());
+        fake.enable_cgx_profile();
+        for (const auto axis : {CgxAxis::RightAscension, CgxAxis::Declination}) fake.set_firmware(axis, {6, 49, 0, 25});
+        refused_identity(fake);
+    }
+}
+
+TEST_CASE("Celestron SkyPortal AUX Driver - Both motor models require the exact modern CGX identity",
+          "[celestron][nexstar-aux][telescope]") {
+    for (const auto axis : {CgxAxis::RightAscension, CgxAxis::Declination}) {
+        for (const auto& reply : std::vector<std::vector<std::uint8_t>>{
+                 {}, {23}, {24}, {0x17}, {0x17, 0x88, 0}, {0x17, 0x89}, {0x18, 0x88}, {0x88, 0x17}}) {
+            INFO("axis=" << static_cast<int>(axis) << ", model length=" << reply.size());
+            test::FakeCelestronAuxServer fake;
+            REQUIRE(fake.ok());
+            fake.enable_cgx_profile();
+            fake.set_model(axis, reply);
+            refused_identity(fake);
+        }
+    }
 }
 
 TEST_CASE("Celestron SkyPortal AUX Driver - Lost stop acknowledgement still sends the sibling stop",
@@ -226,7 +345,7 @@ TEST_CASE("Celestron SkyPortal AUX Driver - Lost stop acknowledgement still send
     fake.lose_stop_reply(0x10);
     auto driver = create_celestron_nexstar_aux_telescope(0, info(fake.port()));
     CHECK_THROWS_AS(driver->set_connected(true), AlpacaException);
-    REQUIRE(fake.wait_for_requests(8));
+    REQUIRE(fake.wait_for_requests(9));
     const auto requests = fake.requests();
     CHECK(std::any_of(requests.begin(), requests.end(),
                       [](const auto& frame) { return frame.destination == 0x11 && frame.command == 0x24; }));

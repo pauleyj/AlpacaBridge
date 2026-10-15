@@ -43,8 +43,7 @@ bool decode_axis_completion(const AuxFrame& response, const char* operation) {
 
 std::uint32_t CelestronAuxLink::get_axis_position(CgxAxis axis, std::chrono::milliseconds timeout) {
     const AuxFrame response =
-        exchange(AuxFrame{.source = source_address_, .destination = axis_address(axis), .command = 0x01, .payload = {}},
-                 timeout);
+        exchange_typed(AuxFrame{.destination = axis_address(axis), .command = 0x01, .payload = {}}, timeout);
     if (response.payload.size() != 3) {
         throw AlpacaException("MC_GET_POSITION returned a payload that is not 24 bits", AlpacaError::DriverException);
     }
@@ -56,12 +55,11 @@ void CelestronAuxLink::set_axis_position(CgxAxis axis, std::uint32_t position, s
     if (position >= (1U << 24)) {
         throw AlpacaException("Celestron AUX encoder position must fit in 24 bits", AlpacaError::InvalidValue);
     }
-    const AuxFrame request{.source = source_address_,
-                           .destination = axis_address(axis),
+    const AuxFrame request{.destination = axis_address(axis),
                            .command = 0x04,
                            .payload = {static_cast<std::uint8_t>(position >> 16),
                                        static_cast<std::uint8_t>(position >> 8), static_cast<std::uint8_t>(position)}};
-    require_empty_ack(exchange(request, timeout), "MC_SET_POSITION");
+    require_empty_ack(exchange_typed(request, timeout), "MC_SET_POSITION");
 }
 
 void CelestronAuxLink::goto_axis_fast(CgxAxis axis, std::uint32_t position, std::chrono::milliseconds timeout) {
@@ -73,56 +71,50 @@ void CelestronAuxLink::goto_axis_slow(CgxAxis axis, std::uint32_t position, std:
 }
 
 void CelestronAuxLink::goto_axis(CgxAxis axis, std::uint32_t position, std::uint8_t command, const char* operation,
-                                std::chrono::milliseconds timeout) {
+                                 std::chrono::milliseconds timeout) {
     if (position >= (1U << 24)) {
         throw AlpacaException("Celestron AUX GOTO position must fit in 24 bits", AlpacaError::InvalidValue);
     }
-    const AuxFrame request{.source = source_address_,
-                           .destination = axis_address(axis),
+    const AuxFrame request{.destination = axis_address(axis),
                            .command = command,
                            .payload = {static_cast<std::uint8_t>(position >> 16),
                                        static_cast<std::uint8_t>(position >> 8), static_cast<std::uint8_t>(position)}};
-    require_empty_ack(exchange(request, timeout), operation);
+    require_empty_ack(exchange_typed(request, timeout), operation);
 }
 
 bool CelestronAuxLink::is_axis_slew_done(CgxAxis axis, std::chrono::milliseconds timeout) {
     return decode_axis_completion(
-        exchange(AuxFrame{.source = source_address_, .destination = axis_address(axis), .command = 0x13, .payload = {}},
-                 timeout),
+        exchange_typed(AuxFrame{.destination = axis_address(axis), .command = 0x13, .payload = {}}, timeout),
         "MC_SLEW_DONE");
 }
 
 void CelestronAuxLink::start_axis_home(CgxAxis axis, std::chrono::milliseconds timeout) {
     require_empty_ack(
-        exchange(AuxFrame{.source = source_address_, .destination = axis_address(axis), .command = 0x0b, .payload = {}},
-                 timeout),
+        exchange_typed(AuxFrame{.destination = axis_address(axis), .command = 0x0b, .payload = {}}, timeout),
         "MC_LEVEL_START");
 }
 
 bool CelestronAuxLink::is_axis_home_done(CgxAxis axis, std::chrono::milliseconds timeout) {
     return decode_axis_completion(
-        exchange(AuxFrame{.source = source_address_, .destination = axis_address(axis), .command = 0x12, .payload = {}},
-                 timeout),
+        exchange_typed(AuxFrame{.destination = axis_address(axis), .command = 0x12, .payload = {}}, timeout),
         "MC_LEVEL_DONE");
 }
 
 void CelestronAuxLink::pulse_guide_axis(CgxAxis axis, int velocity_percent, int duration_centiseconds,
-                                      std::chrono::milliseconds timeout) {
+                                        std::chrono::milliseconds timeout) {
     if (velocity_percent < -100 || velocity_percent > 100 || duration_centiseconds < 1 || duration_centiseconds > 255) {
         throw AlpacaException("Celestron AUX pulse guide rate or duration is out of range", AlpacaError::InvalidValue);
     }
     const auto velocity = static_cast<std::uint8_t>(static_cast<std::int8_t>(velocity_percent));
-    const AuxFrame request{.source = source_address_,
-                           .destination = axis_address(axis),
+    const AuxFrame request{.destination = axis_address(axis),
                            .command = 0x26,
                            .payload = {velocity, static_cast<std::uint8_t>(duration_centiseconds)}};
-    require_empty_ack(exchange(request, timeout), "MC_AUX_GUIDE");
+    require_empty_ack(exchange_typed(request, timeout), "MC_AUX_GUIDE");
 }
 
 bool CelestronAuxLink::is_aux_guide_active(CgxAxis axis, std::chrono::milliseconds timeout) {
     const AuxFrame response =
-        exchange(AuxFrame{.source = source_address_, .destination = axis_address(axis), .command = 0x27, .payload = {}},
-                 timeout);
+        exchange_typed(AuxFrame{.destination = axis_address(axis), .command = 0x27, .payload = {}}, timeout);
     if (response.payload.size() != 1 || response.payload[0] > 1) {
         throw AlpacaException("MC_AUX_GUIDE_ACTIVE returned an invalid status", AlpacaError::DriverException);
     }

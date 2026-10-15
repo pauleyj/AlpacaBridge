@@ -11,14 +11,15 @@
 // https://www.gnu.org/licenses/agpl-3.0.html
 
 #include <alpacacore/util/error_handling.h>
+#include <alpacacore/util/logging.h>
 #include <alpacacore/util/serial_io.h>
 #include <alpacacore/util/serial_port_registry.h>
 #include <alpacacore/vendor/celestron/celestron_aux_link.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <poll.h>
-#include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
@@ -75,11 +76,11 @@ void CelestronAuxLink::connect_serial(const std::string& port_path) {
         throw_link_error("a serial port path is required");
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::timed_mutex> lock(mutex_);
     std::error_code path_error;
     const std::filesystem::path canonical = std::filesystem::canonical(port_path, path_error);
     const std::string registry_path = path_error ? port_path : canonical.string();
-    struct stat held {}, current{};
+    struct stat held{}, current{};
     if (!tcp_ && serial_fd_ >= 0 && registry_path == registered_port_path_ && ::fstat(serial_fd_, &held) == 0 &&
         ::stat(port_path.c_str(), &current) == 0 && held.st_nlink != 0 && held.st_dev == current.st_dev &&
         held.st_ino == current.st_ino && held.st_rdev == current.st_rdev) {
@@ -164,7 +165,11 @@ void CelestronAuxLink::connect_tcp(const std::string& address, int port, std::ch
         throw AlpacaException("Celestron AUX host must be a numeric IPv4 or IPv6 address", AlpacaError::InvalidValue);
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unique_lock<std::timed_mutex> lock(mutex_, std::defer_lock);
+    // Relative waits avoid GCC 14's TSan/steady-clock try_lock_until compile defect.
+    if (!lock.try_lock_for(deadline - std::chrono::steady_clock::now()) || std::chrono::steady_clock::now() >= deadline)
+        throw_link_error("TCP connect timed out waiting for AUX I/O");
     disconnect_locked();
     endpoint_claim_.claim(reinterpret_cast<const sockaddr*>(&storage), port);
     try {
@@ -172,7 +177,6 @@ void CelestronAuxLink::connect_tcp(const std::string& address, int port, std::ch
         if (serial_fd_ < 0) throw_link_error("cannot open TCP socket: " + util::errno_string(errno));
         tcp_ = true;
         source_address_ = 0x20;
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
         const int result = ::connect(serial_fd_, reinterpret_cast<const sockaddr*>(&storage), size);
         if (result < 0) {
             if (errno != EINPROGRESS) throw_link_error("TCP connect failed: " + util::errno_string(errno));
@@ -192,26 +196,34 @@ void CelestronAuxLink::connect_tcp(const std::string& address, int port, std::ch
 }
 
 bool CelestronAuxLink::is_desynchronized() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::timed_mutex> lock(mutex_);
     return desynchronized_;
 }
 
 void CelestronAuxLink::send_stop(CgxAxis axis, std::chrono::milliseconds timeout) {
     validate_timeout(timeout);
     const auto destination = axis_address(axis);
-    std::lock_guard<std::mutex> lock(mutex_);
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unique_lock<std::timed_mutex> lock(mutex_, std::defer_lock);
+    if (tcp_.load()) {
+        if (!lock.try_lock_for(deadline - std::chrono::steady_clock::now()) ||
+            std::chrono::steady_clock::now() >= deadline)
+            throw_link_error("TCP stop timed out waiting for AUX I/O");
+    } else {
+        lock.lock();
+        deadline = std::chrono::steady_clock::now() + timeout;
+    }
     if (serial_fd_ < 0) throw AlpacaException("Celestron AUX is not connected", AlpacaError::NotConnected);
     // Replies to a send-only stop may arrive later. No subsequent normal
     // exchange may treat one as acknowledgement of a different stop.
     desynchronized_ = true;
     ++session_generation_;
     healthy_.store(false);
-    write_frame_locked(encode_aux_frame(AuxFrame{source_address_, destination, 0x24, {0}}),
-                       std::chrono::steady_clock::now() + timeout);
+    write_frame_locked(encode_aux_frame(AuxFrame{source_address_, destination, 0x24, {0}}), deadline);
 }
 
 std::vector<AuxFrame> CelestronAuxLink::take_controller_reports() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::timed_mutex> lock(mutex_);
     std::vector<AuxFrame> result;
     result.swap(controller_reports_);
     return result;
@@ -227,19 +239,36 @@ void CelestronAuxLink::acknowledge_report_locked(const AuxFrame& report,
 }
 
 void CelestronAuxLink::disconnect() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::timed_mutex> lock(mutex_);
     disconnect_locked();
 }
 
 bool CelestronAuxLink::is_connected() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::timed_mutex> lock(mutex_);
     return serial_fd_ >= 0;
 }
 
 AuxFrame CelestronAuxLink::exchange(const AuxFrame& request, std::chrono::milliseconds timeout) {
+    return exchange_impl(request, timeout, false);
+}
+
+AuxFrame CelestronAuxLink::exchange_typed(AuxFrame request, std::chrono::milliseconds timeout) {
+    return exchange_impl(std::move(request), timeout, true);
+}
+
+AuxFrame CelestronAuxLink::exchange_impl(AuxFrame request, std::chrono::milliseconds timeout, bool select_source) {
     validate_timeout(timeout);
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unique_lock<std::timed_mutex> lock(mutex_, std::defer_lock);
+    if (tcp_.load()) {
+        if (!lock.try_lock_for(deadline - std::chrono::steady_clock::now()) ||
+            std::chrono::steady_clock::now() >= deadline)
+            throw_link_error("TCP exchange timed out waiting for AUX I/O");
+    } else {
+        lock.lock();
+        deadline = std::chrono::steady_clock::now() + timeout;
+    }
     if (serial_fd_ < 0) {
         throw AlpacaException("Celestron AUX is not connected", AlpacaError::NotConnected);
     }
@@ -247,8 +276,9 @@ AuxFrame CelestronAuxLink::exchange(const AuxFrame& request, std::chrono::millis
         throw_link_error("AUX response timed out previously; reconnect before issuing another command");
     }
 
+    if (select_source) request.source = source_address_;
+
     const auto started = std::chrono::steady_clock::now();
-    const auto deadline = started + timeout;
     const auto log_failure = [&](std::string_view reason) noexcept {
         try {
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started);
@@ -369,17 +399,28 @@ void CelestronAuxLink::wait_for_locked(short events, std::chrono::steady_clock::
 void CelestronAuxLink::write_frame_locked(const std::vector<std::uint8_t>& bytes,
                                           std::chrono::steady_clock::time_point deadline) {
     std::size_t written = 0;
-    while (written < bytes.size()) {
-        wait_for_locked(POLLOUT, deadline);
-        const ssize_t count = tcp_ ? ::send(serial_fd_, bytes.data() + written, bytes.size() - written, MSG_NOSIGNAL)
-                                   : ::write(serial_fd_, bytes.data() + written, bytes.size() - written);
-        if (count > 0) {
-            written += static_cast<std::size_t>(count);
-        } else if (count == 0 || (count < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
-            const int error = errno;
-            disconnect_locked();
-            throw_link_error("AUX write failed: " + util::errno_string(error));
+    try {
+        while (written < bytes.size()) {
+            wait_for_locked(POLLOUT, deadline);
+            const auto count =
+                tcp_ ? (tcp_sender_
+                            ? tcp_sender_(serial_fd_, bytes.data() + written, bytes.size() - written, MSG_NOSIGNAL)
+                            : ::send(serial_fd_, bytes.data() + written, bytes.size() - written, MSG_NOSIGNAL))
+                     : ::write(serial_fd_, bytes.data() + written, bytes.size() - written);
+            if (count > 0) {
+                written += static_cast<std::size_t>(count);
+            } else if (count == 0 || (count < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                const int error = errno;
+                disconnect_locked();
+                throw_link_error("AUX write failed: " + util::errno_string(error));
+            }
         }
+    } catch (...) {
+        // A later stop could complete the unfinished TCP frame as a motion command.
+        if (tcp_ && written > 0 && written < bytes.size()) {
+            disconnect_locked();
+        }
+        throw;
     }
 }
 

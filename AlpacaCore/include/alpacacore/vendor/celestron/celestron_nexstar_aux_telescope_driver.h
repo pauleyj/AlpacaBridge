@@ -32,9 +32,11 @@ struct NexStarAuxConnectionInfo {
     double focal_length = 0.0;
 };
 
-// Construction is hardware-free. This initial profile identifies northern CGX,
+// Construction is hardware-free. This initial profile requires matching four-byte
+// motor firmware and model 0x1788 on both axes of a northern CGX (USB identity evidence),
 // takes over into a verified stopped state, and serves status telemetry. Sky
-// coordinates/motion remain unavailable until the reference/geometry slice.
+// coordinates/motion remain unavailable until the reference/geometry slice;
+// SkyPortal identity and takeover still require independent hardware qualification.
 std::unique_ptr<TelescopeDriver> create_celestron_nexstar_aux_telescope(
     int device_number, const NexStarAuxConnectionInfo& info, util::TaskClock& clock = util::default_task_clock());
 

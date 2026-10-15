@@ -472,27 +472,41 @@ std::string CelestronNexStarAuxTelescopeDriver::identify() {
     std::array<AuxFrame, 2> versions;
     for (int i = 0; i < 2; ++i) {
         versions[i] = query(axes[i], 0xfe);
-        if (versions[i].payload.size() != 2)
-            throw AlpacaException("SkyPortal AUX motor firmware reply must contain two bytes",
-                                  AlpacaError::DriverException);
+        if (versions[i].payload.size() != 4)
+            throw AlpacaException(
+                "SkyPortal AUX requires four-byte motor firmware replies on both axes; legacy or mixed profiles are "
+                "not qualified",
+                AlpacaError::DriverException);
         // TODO: qualify other firmware profiles before relying on guide-active queries there.
         const auto& version = versions[i].payload;
         if (version[0] * 256 + version[1] < 6 * 256 + 50)
             throw AlpacaException("SkyPortal AUX takeover requires motor firmware 6.50 or newer",
                                   AlpacaError::DriverException);
     }
-    const auto model = query(CgxAxis::RightAscension, 0x05);
-    if (model.payload != std::vector<std::uint8_t>{23})
-        throw AlpacaException("This SkyPortal AUX profile supports CGX (model 23) only; other models are not qualified",
-                              AlpacaError::DriverException);
+    if (versions[0].payload != versions[1].payload)
+        throw AlpacaException(
+            "SkyPortal AUX requires matching motor firmware on both axes; mismatched profiles are not qualified",
+            AlpacaError::DriverException);
+    // USB identity evidence: docs/celestron-cgx-usb-identity.md. SkyPortal remains unqualified.
+    for (const auto axis : axes) {
+        const auto model = query(axis, 0x05);
+        if (model.payload != std::vector<std::uint8_t>{0x17, 0x88})
+            throw AlpacaException(
+                "SkyPortal AUX requires CGX motor model 0x1788 on both axes; CGX-L and other identities are not "
+                "qualified",
+                AlpacaError::DriverException);
+    }
     for (const auto axis : axes) {
         const auto approach = query(axis, 0xfc);
         if (approach.payload.size() != 1 || approach.payload[0] > 1)
             throw AlpacaException("SkyPortal AUX controller approach direction is invalid",
                                   AlpacaError::DriverException);
     }
-    return "RA " + std::to_string(versions[0].payload[0]) + "." + std::to_string(versions[0].payload[1]) + ", Dec " +
-           std::to_string(versions[1].payload[0]) + "." + std::to_string(versions[1].payload[1]);
+    const auto format_version = [](const auto& bytes) {
+        return std::to_string(bytes[0]) + "." + std::to_string(bytes[1]) + "." +
+               std::to_string((static_cast<std::uint16_t>(bytes[2]) << 8) | bytes[3]);
+    };
+    return "RA " + format_version(versions[0].payload) + ", Dec " + format_version(versions[1].payload);
 }
 
 AuxStatus CelestronNexStarAuxTelescopeDriver::sample() {

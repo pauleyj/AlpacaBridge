@@ -13,16 +13,88 @@
 #include <alpacacore/vendor/celestron/celestron_aux_link.h>
 #include <alpacacore/vendor/celestron/celestron_protocol_wrapper.h>
 
+#include <algorithm>
 #include <future>
 
 #include "catch2_compat.h"
 #include "fake_celestron_aux_server.h"
+#include "fake_celestron_cgx_mount.h"
 
 using namespace std::chrono_literals;
 namespace AlpacaError = alpacacore::AlpacaError;
 using alpacacore::AlpacaException;
 using alpacacore::test::FakeCelestronAuxServer;
 using namespace alpacacore::vendor::celestron;
+
+TEST_CASE("Celestron AUX TCP - typed commands select the live source while raw exchanges retain their address",
+          "[celestron][aux][tcp]") {
+    FakeCelestronAuxServer server;
+    REQUIRE(server.ok());
+    CelestronAuxLink link;
+    link.connect_tcp("127.0.0.1", server.port(), 500ms);
+    CHECK(link.get_axis_position(CgxAxis::RightAscension) == 0x123456);
+    const auto response = link.exchange(AuxFrame{0x21, 0x11, 0x01, {}}, 500ms);
+    CHECK(response.destination == 0x21);
+    const auto requests = server.requests();
+    REQUIRE(requests.size() == 2);
+    CHECK(requests[0].source == 0x20);
+    CHECK(requests[1].source == 0x21);
+    alpacacore::test::FakeCelestronCgxMount usb;
+    REQUIRE(usb.ok());
+    link.connect_serial(usb.slave_path());
+    CHECK(link.get_axis_position(CgxAxis::RightAscension) == 0);
+    const auto serial_requests = usb.requests();
+    REQUIRE(serial_requests.size() == 1);
+    CHECK(serial_requests[0].source == 0x00);
+}
+
+TEST_CASE("Celestron AUX TCP - an incomplete frame closes the link before any stop can append bytes",
+          "[celestron][aux][tcp]") {
+    for (const std::uint8_t command : {0x02, 0x50, 0x24}) {
+        INFO("Partial command " << static_cast<int>(command));
+        FakeCelestronAuxServer server;
+        REQUIRE(server.ok());
+        std::size_t remaining = command == 0x02 ? 6 : 3;
+        std::size_t transmitted = 0;
+        bool partial = false;
+        CelestronAuxLink link([&](int fd, const void* data, std::size_t size, int flags) -> std::ptrdiff_t {
+            const auto* bytes = static_cast<const std::uint8_t*>(data);
+            if (!partial && size >= 5 && bytes[4] == command) partial = true;
+            if (partial && remaining == 0) {
+                errno = EAGAIN;
+                return -1;
+            }
+            const auto count = ::send(fd, data, partial ? std::min(size, remaining) : size, flags);
+            if (count > 0) {
+                transmitted += static_cast<std::size_t>(count);
+                if (partial) remaining -= static_cast<std::size_t>(count);
+            }
+            return count;
+        });
+        link.connect_tcp("127.0.0.1", server.port(), 500ms);
+        const auto generation = link.session_generation();
+        if (command == 0x02) {
+            CHECK_THROWS_AS(link.goto_axis_fast(CgxAxis::RightAscension, 0x6a0000, 20ms), AlpacaException);
+        } else if (command == 0x50) {
+            server.report_before_reply();
+            CHECK_THROWS_AS(link.get_axis_position(CgxAxis::RightAscension, 20ms), AlpacaException);
+        } else {
+            CHECK_THROWS_AS(link.send_stop(CgxAxis::RightAscension, 20ms), AlpacaException);
+        }
+        REQUIRE(partial);
+        REQUIRE(remaining == 0);
+        CHECK_FALSE(link.is_connected());
+        CHECK_FALSE(link.is_healthy());
+        CHECK(link.session_generation() > generation);
+        const auto before_stops = transmitted;
+        CHECK_THROWS_AS(link.send_stop(CgxAxis::RightAscension, 20ms), AlpacaException);
+        CHECK_THROWS_AS(link.send_stop(CgxAxis::Declination, 20ms), AlpacaException);
+        CHECK(transmitted == before_stops);
+        CelestronAuxLink replacement;
+        CHECK_NOTHROW(replacement.connect_tcp("127.0.0.1", server.port(), 500ms));
+        CHECK(replacement.get_axis_position(CgxAxis::RightAscension) == 0x123456);
+    }
+}
 
 TEST_CASE("Celestron AUX TCP - fragmented replies use the WiFi application address", "[celestron][aux][tcp]") {
     FakeCelestronAuxServer server;
@@ -42,6 +114,78 @@ TEST_CASE("Celestron AUX TCP - fragmented replies use the WiFi application addre
     REQUIRE(requests.size() == 1);
     CHECK(requests[0].source == 0x20);
     CHECK(requests[0].destination == 0x10);
+}
+
+TEST_CASE("Celestron AUX TCP - queued I/O expires without dispatching or poisoning the active exchange",
+          "[celestron][aux][tcp]") {
+    for (const int operation : {0, 1, 2}) {
+        CAPTURE(operation);
+        FakeCelestronAuxServer server;
+        REQUIRE(server.ok());
+        CelestronAuxLink link;
+        link.connect_tcp("127.0.0.1", server.port(), 500ms);
+        const auto generation = link.session_generation();
+        server.fragment_next_reply();
+        auto active =
+            std::async(std::launch::async, [&] { return link.get_axis_position(CgxAxis::RightAscension, 2500ms); });
+        const bool held = server.wait_for_fragment();
+        auto queued = std::async(std::launch::async, [&] {
+            try {
+                if (operation == 0)
+                    link.send_stop(CgxAxis::Declination, 20ms);
+                else if (operation == 1)
+                    static_cast<void>(link.get_axis_position(CgxAxis::Declination, 20ms));
+                else
+                    link.connect_tcp("127.0.0.1", server.port(), 20ms);
+                return false;
+            } catch (const AlpacaException& error) {
+                return error.error_code() == AlpacaError::DriverException;
+            }
+        });
+        const auto status = queued.wait_for(250ms);
+        server.release_fragment();
+        REQUIRE(held);
+        CHECK(status == std::future_status::ready);
+        CHECK(queued.get());
+        CHECK(active.get() == 0x123456);
+        CHECK(link.is_healthy());
+        CHECK_FALSE(link.is_desynchronized());
+        CHECK(link.session_generation() == generation);
+        REQUIRE(server.requests().size() == 1);
+        CHECK(link.get_axis_position(CgxAxis::Declination) == 0x123456);
+    }
+}
+
+TEST_CASE("Celestron AUX serial - queued exchange and stop retain their post-lock I/O budget",
+          "[celestron][aux][cgx][serial]") {
+    for (const bool stop : {false, true}) {
+        CAPTURE(stop);
+        alpacacore::test::FakeCelestronCgxMount usb;
+        REQUIRE(usb.ok());
+        CelestronAuxLink link;
+        link.connect_serial(usb.slave_path());
+        const auto generation = link.session_generation();
+        usb.fragment_next_reply();
+        auto active =
+            std::async(std::launch::async, [&] { return link.get_axis_position(CgxAxis::RightAscension, 2500ms); });
+        const bool held = usb.wait_for_reply_fragment(2s);
+        auto queued = std::async(std::launch::async, [&] {
+            if (stop) {
+                link.send_stop(CgxAxis::Declination, 20ms);
+                return std::uint32_t{0};
+            }
+            return link.get_axis_position(CgxAxis::Declination, 20ms);
+        });
+        const auto before_release = queued.wait_for(100ms);
+        usb.release_reply_tail();
+        REQUIRE(held);
+        CHECK(before_release == std::future_status::timeout);
+        CHECK(active.get() == 0);
+        CHECK(queued.get() == 0);
+        CHECK(link.is_desynchronized() == stop);
+        CHECK(link.is_healthy() == !stop);
+        CHECK((link.session_generation() != generation) == stop);
+    }
 }
 
 TEST_CASE("Celestron AUX TCP - acknowledges coalesced controller reports without losing the reply",
@@ -89,6 +233,43 @@ TEST_CASE("Celestron AUX TCP - timeout poisons exchanges but transmits both axis
     server.set_muted(false);
     link.connect_tcp("127.0.0.1", server.port(), 500ms);
     CHECK(link.get_axis_position(CgxAxis::RightAscension) == 0x123456);
+}
+
+TEST_CASE("Celestron AUX TCP - report overflow poisons the link without discarding pending reports",
+          "[celestron][aux][tcp]") {
+    FakeCelestronAuxServer server;
+    REQUIRE(server.ok());
+    CelestronAuxLink link;
+    link.connect_tcp("127.0.0.1", server.port(), 500ms);
+    const auto generation = link.session_generation();
+    for (int i = 0; i < 16; ++i) {
+        server.report_before_reply();
+        REQUIRE(link.get_axis_position(CgxAxis::RightAscension) == 0x123456);
+    }
+    server.report_before_reply();
+    CHECK_THROWS_AS(link.get_axis_position(CgxAxis::RightAscension), AlpacaException);
+    CHECK(link.is_desynchronized());
+    CHECK_FALSE(link.is_healthy());
+    CHECK(link.session_generation() != generation);
+    const auto reports = link.take_controller_reports();
+    REQUIRE(reports.size() == 16);
+    for (const auto& report : reports) {
+        CHECK(report.command == 0x50);
+        CHECK(report.payload == std::vector<std::uint8_t>{1});
+    }
+    // Consuming reports cannot make a delayed reply safe to match again.
+    CHECK_THROWS_AS(link.get_axis_position(CgxAxis::RightAscension), AlpacaException);
+    link.send_stop(CgxAxis::RightAscension, 100ms);
+    link.send_stop(CgxAxis::Declination, 100ms);
+    REQUIRE(server.wait_for_requests(36));
+    const auto requests = server.requests();
+    REQUIRE(requests.size() == 36);
+    CHECK(requests[34].destination == 0x10);
+    CHECK(requests[35].destination == 0x11);
+    CHECK(requests[34].command == 0x24);
+    CHECK(requests[35].command == 0x24);
+    CHECK(requests[34].payload == std::vector<std::uint8_t>{0});
+    CHECK(requests[35].payload == std::vector<std::uint8_t>{0});
 }
 
 TEST_CASE("Celestron AUX TCP - HC and AUX exclude the same endpoint and release claims", "[celestron][aux][tcp]") {

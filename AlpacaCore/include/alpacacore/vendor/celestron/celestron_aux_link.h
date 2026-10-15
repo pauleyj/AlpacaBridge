@@ -17,8 +17,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <functional>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace alpacacore::vendor::celestron {
@@ -28,7 +31,10 @@ enum class CgxAxis : std::uint8_t { RightAscension = 0x10, Declination = 0x11 };
 /// Per-driver, serialized AUX link. Serial uses source 0x00; SkyPortal uses 0x20.
 class CelestronAuxLink final {
 public:
+    // Inject TCP sends to exercise partial OS writes without touching a real mount.
+    using TcpSender = std::function<std::ptrdiff_t(int, const void*, std::size_t, int)>;
     CelestronAuxLink() = default;
+    explicit CelestronAuxLink(TcpSender tcp_sender) : tcp_sender_(std::move(tcp_sender)) {}
     ~CelestronAuxLink();
 
     CelestronAuxLink(const CelestronAuxLink&) = delete;
@@ -53,9 +59,9 @@ public:
     void set_axis_position(CgxAxis axis, std::uint32_t position,
                            std::chrono::milliseconds timeout = std::chrono::milliseconds(500));
     void goto_axis_fast(CgxAxis axis, std::uint32_t position,
-                         std::chrono::milliseconds timeout = std::chrono::milliseconds(500));
+                        std::chrono::milliseconds timeout = std::chrono::milliseconds(500));
     void goto_axis_slow(CgxAxis axis, std::uint32_t position,
-                         std::chrono::milliseconds timeout = std::chrono::milliseconds(500));
+                        std::chrono::milliseconds timeout = std::chrono::milliseconds(500));
     bool is_axis_slew_done(CgxAxis axis, std::chrono::milliseconds timeout = std::chrono::milliseconds(500));
     void start_axis_home(CgxAxis axis, std::chrono::milliseconds timeout = std::chrono::milliseconds(500));
     bool is_axis_home_done(CgxAxis axis, std::chrono::milliseconds timeout = std::chrono::milliseconds(500));
@@ -64,6 +70,8 @@ public:
     bool is_aux_guide_active(CgxAxis axis, std::chrono::milliseconds timeout = std::chrono::milliseconds(500));
 
 private:
+    AuxFrame exchange_typed(AuxFrame request, std::chrono::milliseconds timeout);
+    AuxFrame exchange_impl(AuxFrame request, std::chrono::milliseconds timeout, bool select_source);
     void goto_axis(CgxAxis axis, std::uint32_t position, std::uint8_t command, const char* operation,
                    std::chrono::milliseconds timeout);
     void disconnect_locked();
@@ -72,17 +80,18 @@ private:
     std::vector<std::uint8_t> read_frame_locked(std::chrono::steady_clock::time_point deadline);
     void acknowledge_report_locked(const AuxFrame& report, std::chrono::steady_clock::time_point deadline);
 
-    mutable std::mutex mutex_;
+    mutable std::timed_mutex mutex_;
     int serial_fd_ = -1;
     std::atomic<std::uint64_t> session_generation_{0};
     std::atomic<bool> healthy_{false};
-    bool tcp_ = false;
-    std::atomic<std::uint8_t> source_address_{0x00};
+    std::atomic<bool> tcp_{false};
+    std::uint8_t source_address_ = 0x00;
     bool desynchronized_ = false;
     std::string registered_port_path_;
     CelestronEndpointClaim endpoint_claim_;
     std::vector<std::uint8_t> receive_buffer_;
     std::vector<AuxFrame> controller_reports_;
+    TcpSender tcp_sender_;
 };
 
 }  // namespace alpacacore::vendor::celestron

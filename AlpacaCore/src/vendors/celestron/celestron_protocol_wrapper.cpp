@@ -47,6 +47,11 @@ namespace alpacacore::vendor::celestron {
 
 namespace {
 
+bool tcp_transport_lost(int error) {
+    return error == ECONNRESET || error == ECONNABORTED || error == EPIPE || error == ENOTCONN || error == EBADF ||
+           error == ENOTSOCK || error == ETIMEDOUT;
+}
+
 // Probe a serial port for a NexStar hand controller using the echo command (Kx).
 // Returns HC firmware version string (e.g. "5.35") on success, empty on failure.
 std::string probe_nexstar_port(const std::string& port_path) {
@@ -397,13 +402,13 @@ public:
 
         std::lock_guard<std::mutex> lock(mutex_);
 
-        if (connected_) {
+        if (reserved_) {
             // The protocol wrapper is a per-vendor singleton: a second device
             // connecting through it would silently steal/tear down the first
             // device's connection. Refuse instead.
             throw AlpacaException(
                 "Only one Celestron mount per bridge: the shared Celestron "
-                "protocol wrapper is already connected");
+                "protocol wrapper is reserved; disconnect the existing mount first");
         }
 
         connection_type_ = info.type;
@@ -429,6 +434,7 @@ public:
         }
 
         connected_ = success;
+        reserved_ = success;
         return success;
     }
 
@@ -440,7 +446,7 @@ public:
     // Tear down the connection. Caller MUST already hold mutex_ (so connect()
     // can reuse it without the non-recursive mutex deadlocking on re-lock).
     void disconnect_locked() {
-        if (!connected_) {
+        if (!reserved_) {
             return;
         }
         if (connection_type_ == ConnectionType::Serial) {
@@ -451,6 +457,7 @@ public:
             disconnect_network();
         }
         connected_ = false;
+        reserved_ = false;
     }
 
     bool is_connected() const {
@@ -491,6 +498,7 @@ public:
         try {
             (void)read_response(false, 40);
         } catch (...) {
+            if (connection_type_ == ConnectionType::Network && !connected_) throw;
             // Ignore optional response drain errors for fire-and-forget commands.
         }
     }
@@ -1575,7 +1583,12 @@ private:
     bool write_network(const std::string& data) {
         // Loop over short sends; MSG_NOSIGNAL so a dropped peer can't SIGPIPE
         // the server.
-        return util::send_all(socket_fd_, data.c_str(), data.length(), MSG_NOSIGNAL);
+        if (util::send_all(socket_fd_, data.c_str(), data.length(), MSG_NOSIGNAL)) return true;
+        if (tcp_transport_lost(errno)) {
+            disconnect_network();
+            connected_ = false;
+        }
+        return false;
     }
 
     std::string read_response(bool require_hash_terminator, int timeout_ms,
@@ -1672,6 +1685,11 @@ private:
 
     bool read_network_char(char& ch) {
         ssize_t bytes_received = recv(socket_fd_, &ch, 1, 0);
+        if (bytes_received == 0 || (bytes_received < 0 && tcp_transport_lost(errno))) {
+            disconnect_network();
+            connected_ = false;
+            throw AlpacaException("Celestron TCP connection was lost", AlpacaError::DriverException);
+        }
         return bytes_received == 1;
     }
 
@@ -1687,6 +1705,8 @@ private:
 private:
     mutable std::mutex mutex_;
     bool connected_;
+    // Socket loss releases the endpoint, not its owning driver's singleton reservation.
+    bool reserved_ = false;
     ConnectionType connection_type_;
     ConnectionInfo connection_info_;
 

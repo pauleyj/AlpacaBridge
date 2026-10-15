@@ -183,8 +183,9 @@ if(TARGET alpacacore_gphoto)
     list(APPEND TEST_SOURCES test_gphoto_concurrency_stress.cpp)
 endif()
 if(TARGET alpacacore_celestron)
+    list(APPEND TEST_SOURCES test_celestron_endpoint_loss.cpp)
     list(APPEND TEST_SOURCES test_celestron_telescope.cpp test_celestron_cgx_protocol.cpp
-         test_celestron_aux_tcp.cpp
+         test_celestron_aux_tcp.cpp test_celestron_aux_reports.cpp
          test_celestron_nexstar_aux_telescope.cpp test_celestron_nexstar_aux_concurrency_stress.cpp
          test_celestron_cgx_geometry.cpp test_celestron_cgx_telescope.cpp
          test_celestron_cgx_telemetry.cpp

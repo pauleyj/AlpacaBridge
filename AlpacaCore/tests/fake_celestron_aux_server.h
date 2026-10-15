@@ -12,7 +12,7 @@
 
 #pragma once
 
-#include <alpacacore/vendor/celestron/celestron_cgx_protocol.h>
+#include <alpacacore/vendor/celestron/celestron_aux_link.h>
 #include <arpa/inet.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -30,6 +30,7 @@
 namespace alpacacore::test {
 
 // Transport fake only: no motor dynamics, calibration, or firmware qualification.
+// CGX identity replies mirror docs/celestron-cgx-usb-identity.md, not SkyPortal rig evidence.
 // Unknown commands are silent. Every socket wait/send and teardown is bounded.
 class FakeCelestronAuxServer final {
 public:
@@ -62,12 +63,32 @@ public:
     void set_muted(bool value) { muted_ = value; }
     void corrupt_next_reply() { corrupt_ = true; }
     void report_before_reply() { report_ = true; }
+    void report_before_reply(const Frame& report) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        before_reply_ = vendor::celestron::encode_aux_frame(report);
+    }
+    void report_after_reply(const Frame& report) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        after_reply_ = vendor::celestron::encode_aux_frame(report);
+    }
+    void truncate_next_reply() { truncate_ = true; }
+    void close_after_reply() { close_after_ = true; }
     void fragment_next_reply() { fragment_ = true; }
     void unrelated_until_deadline() { noise_ = true; }
     void close_next_connection() { close_next_ = true; }
     void enable_cgx_profile() { cgx_ = true; }
-    void set_model(std::uint8_t value) { model_ = value; }
-    void set_firmware_major(std::uint8_t value) { firmware_major_ = value; }
+    void set_model(std::uint16_t value) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& model : models_) model = {static_cast<std::uint8_t>(value >> 8), static_cast<std::uint8_t>(value)};
+    }
+    void set_model(vendor::celestron::CgxAxis axis, std::vector<std::uint8_t> reply) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        models_[axis == vendor::celestron::CgxAxis::Declination ? 1 : 0] = std::move(reply);
+    }
+    void set_firmware(vendor::celestron::CgxAxis axis, std::vector<std::uint8_t> reply) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        firmware_[axis == vendor::celestron::CgxAxis::Declination ? 1 : 0] = std::move(reply);
+    }
     void set_moving(bool value) {
         for (auto& moving : moving_) moving = value;
     }
@@ -140,11 +161,11 @@ private:
                 if (muted_ || request.command == 0x50 || request.command == 0x51) continue;
                 const std::size_t axis = request.destination == 0x11 ? 1 : 0;
                 std::vector<std::uint8_t> payload;
-                if (request.command == 0xfe)
-                    payload = {firmware_major_.load(), 18};
-                else if (cgx_ && request.command == 0x05)
-                    payload = {model_.load()};
-                else if (cgx_ && request.command == 0xfc)
+                if (request.command == 0xfe || (cgx_ && request.command == 0x05)) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    payload = request.command == 0x05 ? models_[axis]
+                                                      : (cgx_ ? firmware_[axis] : std::vector<std::uint8_t>{7, 18});
+                } else if (cgx_ && request.command == 0xfc)
                     payload = {0};
                 else if (cgx_ && request.command == 0x13)
                     payload = {static_cast<std::uint8_t>(moving_[axis] ? 0 : 0xff)};
@@ -169,6 +190,15 @@ private:
                     warning.insert(warning.end(), reply.begin(), reply.end());
                     reply = std::move(warning);
                 }
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    reply.insert(reply.begin(), before_reply_.begin(), before_reply_.end());
+                    reply.insert(reply.end(), after_reply_.begin(), after_reply_.end());
+                    before_reply_.clear();
+                    after_reply_.clear();
+                }
+                const bool truncated = truncate_.exchange(false);
+                if (truncated) reply.resize(2);
                 if (fragment_.exchange(false)) {
                     if (!send_bytes(fd, {reply[0], reply[1]})) return;
                     std::unique_lock<std::mutex> lock(mutex_);
@@ -179,6 +209,8 @@ private:
                     reply.erase(reply.begin(), reply.begin() + 2);
                 }
                 if (!send_bytes(fd, reply)) return;
+                const bool close_after = close_after_.exchange(false);
+                if (truncated || close_after) return;
             }
         }
     }
@@ -198,13 +230,17 @@ private:
     std::thread worker_;
     std::atomic<bool> stop_{false}, muted_{false}, corrupt_{false}, report_{false}, fragment_{false}, noise_{false},
         close_next_{false};
+    std::atomic<bool> truncate_{false}, close_after_{false};
     std::atomic<bool> cgx_{false}, ignore_stops_{false};
     std::array<std::atomic<bool>, 2> moving_{false, false};
-    std::atomic<std::uint8_t> model_{23}, firmware_major_{7}, lose_stop_axis_{0};
+    std::atomic<std::uint8_t> lose_stop_axis_{0};
+    std::array<std::vector<std::uint8_t>, 2> models_{{{0x17, 0x88}, {0x17, 0x88}}};
+    std::array<std::vector<std::uint8_t>, 2> firmware_{{{7, 17, 0, 25}, {7, 17, 0, 25}}};
     std::array<std::atomic<std::uint32_t>, 2> position_{0x123456, 0x123456};
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     bool held_ = false, released_ = false;
+    std::vector<std::uint8_t> before_reply_, after_reply_;
     std::vector<Frame> requests_;
 };
 

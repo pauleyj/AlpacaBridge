@@ -25,6 +25,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <string>
@@ -76,6 +77,8 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(std::shared_ptr
         if (st->silent.load()) return "";
         if (chunk.empty()) return "0#";
         switch (chunk[0]) {
+            case 'V':
+                return std::string("\x05\x23#", 3);  // Two binary firmware bytes, then a separate terminator.
             case 'e':
             case 'E':
             case 'z':
@@ -108,6 +111,7 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(std::shared_ptr
                 return st->tracking_on.load() ? std::string("\x02#") : std::string("\x00#", 2);
             case 'P': {  // AUX passthrough: P len dev op ...
                 const unsigned char op = chunk.size() > 3 ? static_cast<unsigned char>(chunk[3]) : 0;
+                if (op == 0xFE) return std::string("\x07\x11#", 3);
                 if (op == 0x0B) {
                     st->level_start_count.fetch_add(1);
                     if (st->reject_level_start.load()) return "";
@@ -192,6 +196,14 @@ bool advance_until(alpacacore::test::FakeTaskClock& clock, const std::function<b
 }
 
 }  // namespace
+
+TEST_CASE("Fake Celestron responder - firmware replies contain both bytes and a terminator",
+          "[celestron][telescope][async][fake]") {
+    const auto responder = celestron_responder(std::make_shared<FakeCelestronState>());
+    CHECK(responder("V") == std::string("\x05\x23#", 3));
+    const std::string request{'P', 1, 0x10, static_cast<char>(0xFE), 0, 0, 0, 2};
+    CHECK(responder(request) == std::string("\x07\x11#", 3));
+}
 
 TEST_CASE("Celestron async - Park returns immediately, AtPark flips when the slew ends",
           "[celestron][telescope][async]") {
@@ -525,12 +537,27 @@ TEST_CASE("Celestron sync slew - superseded by AbortSlew, Park or MoveAxis throw
             t_at_exit.store(st->t_count.load());
             done.store(true);
         });
-        REQUIRE(wait_until([&] { return st->goto_seen.load(); }, 5000));  // the GOTO is on the wire
-        c.supersede(*driver);
+        const bool started = wait_until([&] { return st->goto_seen.load(); }, 5000);
+        std::exception_ptr supersede_error;
+        try {
+            if (started)
+                c.supersede(*driver);
+            else
+                driver->abort_slew();
+        } catch (...) {
+            supersede_error = std::current_exception();
+            try {
+                driver->abort_slew();
+            } catch (...) {
+            }
+        }
         const int t_after_supersede = st->t_count.load();
         // The slewer sleeps on the task clock between polls; step it until it has noticed.
-        REQUIRE(advance_until(clock, [&] { return done.load(); }));
+        const bool finished = advance_until(clock, [&] { return done.load(); });
         slewer.join();
+        REQUIRE(started);  // The GOTO must have reached the fake, not been refused.
+        if (supersede_error) std::rethrow_exception(supersede_error);
+        REQUIRE(finished);
         CHECK(code.load() == static_cast<int>(alpacacore::AlpacaError::InvalidOperation));
         CHECK(t_at_exit.load() == t_after_supersede);  // no tracking restore after the supersede
         driver->set_connected(false);
