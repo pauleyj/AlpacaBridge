@@ -1,14 +1,41 @@
 # Celestron SkyPortal AUX implementation progress
 
+## End-of-day checkpoint — 2026-10-15 local / 2026-10-16 UTC
+
+Stopped after the successful supervised **idle** lifecycle check; no further
+hardware commands are queued. RPi Ethernet and original `NCC-1701` WiFi are
+active, temporary SkyPortal profiles are removed, and no harness/build/test
+process remains running. The installed service/binary/config were not changed.
+
+At the pre-commit checkpoint, work was uncommitted on
+`driver/celestron-nexstar-aux-wifi`, HEAD `aa109c5d`. Today's production delta is only the USB diagnostic compatibility
+fix; tests add the two report-publication cases. Documentation, scoped guidance,
+changelog and the external plan contain the new identity/native/lifecycle evidence.
+The operator subsequently requested committing and pushing this checkpoint to
+the fork; use the branch history for its publication commit.
+
+Resume with independent geometry fixtures and an explicit reference/calibration
+workflow, then two-phase Sync. Connect must not invent calibrated coordinates;
+tracking, GOTO, guide/manual motion and Park remain unavailable. Before another
+physical test, reconfirm operator presence and bare/clear-mount conditions; today's
+permission is not unattended authorization for a later session.
+
+Final native Celestron-only Debug/UBSan **520/520**, focused TSan **48/1,411**,
+stress **7/17**; read-only motor identity and one idle takeover check passed.
+ASan on a compatible arm64 host, all-vendor/full integration, active-motion stop,
+reference/Sync and all coordinate-motion qualification remain outstanding.
+
 ## Branch and scope
 
 Started 2026-10-13 on `driver/celestron-nexstar-aux-wifi`, stacked on
 `driver/celestron-cgx-usb` at `37de2b25`. The implementation plan is
 `/home/pauleyj/src/open-astro/nexstar-aux-wifi-port-plan.md`.
 
-Current base: upstream `main` at `782294de01347d9c0ffa3259f8dd69cb429af9a4`,
-after PR #1148 merged. The existing WiFi commit was replayed as `55060596`;
-review changes remain uncommitted and unstaged. See the rebase record below.
+Current published checkpoint: `aa109c5d`, two WiFi commits above PR #1200 USB
+head `6e38ede3cb40fdc17e1aacff5939a8d5804179dc`. Local/fork main are at
+`c4f8937f106c9a7e389e3bef5051544f995b6998`. The latest user-approved rebase
+and force-with-lease push supersede the older uncommitted/no-push status below.
+Deployment and physical-test restrictions remain in force.
 
 The branch implements the shared serial/TCP AUX link and a selectable lifecycle-only
 WiFi telescope; coordinate motion is still unavailable. `CelestronCgxProtocol` remains a source alias for the USB
@@ -106,7 +133,29 @@ their original source provenance; native C++ suites have not been rerun on `7822
 Post-rebase repository gates, whitespace checks and **82/82** web tests passed;
 the external plan's 45 navigation links also validate.
 
-## Verification
+### Latest USB rebase and fork publication — 2026-10-15
+
+After the user approved committing/pushing the review slice (`61d338ac`), main
+advanced to `c4f8937f` and local `driver/celestron-cgx-usb` advanced to PR #1200
+head `6e38ede3`. The user requested rebasing WiFi onto that USB branch: the two
+WiFi commits became `c9d57963` and `aa109c5d`. Backup ref
+`backup/aux-wifi-pre-cgx-rebase-20261015T233852Z` preserves `61d338ac`.
+The fork WiFi branch was subsequently updated to `aa109c5d` with an explicit
+force-with-lease at the user's request. No merge/rebase is pending.
+
+The USB telescope implementation, shared telescope header, CGX
+protocol/telescope/telemetry tests and published USB report match `6e38ede3`
+exactly. Conflict resolution retained newer USB transaction-failure diagnostics
+in the extracted shared link's `exchange_impl()`. The imported USB report now
+records motors 7.18.2214 / model `0x1788`, binary `f11acde9`, bare northern CGX,
+with all 98 timing rows passing. This is USB evidence, not WiFi qualification.
+
+Immediate post-rebase C++20 syntax-only and whitespace checks passed. Earlier
+505-case Debug/UBSan and TSan passes below retain their `709f1976` attribution;
+they do not certify `aa109c5d`. Native reruns are the next offline gate. No
+deployment, real mount query, takeover or motion occurred during the rebase/push.
+
+## Verification (historical source snapshots)
 
 Native arm64 checks ran on `pauleyj@192.168.4.44` (RPi4, aarch64,
 kernel `6.18.34+rpt-rpi-v8`) in an isolated checkout at
@@ -144,20 +193,155 @@ focused suite passed. Refresh line numbers before using these in a PR body.
 
 ## Next slice and hardware gates
 
+### Offline report-publication regressions — 2026-10-15
+
+Added two lifecycle-driver cases after the `aa109c5d` checkpoint, using the
+existing TCP fake and virtual clock. Both motor addresses are exercised: low
+battery warnings remain diagnostic-only, while motion-limit warnings and controller
+errors are acknowledged, refuse the warm Tracking/Slewing snapshot, retain their
+fault without autonomous polling/reconnect, and become lost at 30 virtual seconds.
+No production behavior, capabilities, fake dynamics or USB sources changed.
+
+C++20 syntax-only, changed-range formatting and whitespace checks passed locally.
+Native arm64 focused Debug, UBSan and TSan each passed **20 cases / 726
+assertions**, including these additions. Both mutations below were observed
+failing with exit 42, then original production code was restored and the clean
+focused cases passed. The low-battery mutation caused 14 failed assertions;
+the motion-report mutation caused 4. Literal `if(false)` needed an otherwise
+inert `static_cast<void>(report)` to avoid an unused-variable build failure.
+These are fake-only results, not physical report qualification.
+
+- "Celestron SkyPortal AUX Driver - Low battery reports remain diagnostic-only": AlpacaCore/src/vendors/celestron/celestron_nexstar_aux_telescope_driver.cpp:523 replace the diagnostic-warning condition with false.
+- "Celestron SkyPortal AUX Driver - Controller motion reports latch until virtual-time link loss": AlpacaCore/src/vendors/celestron/celestron_nexstar_aux_telescope_driver.cpp:526 replace the controller-report throw with continue.
+
+### Rebased native validation — one USB regression blocks motion
+
+**Resolved by the USB-prefix fix below.** The failures in this section are the
+pre-fix results; do not treat them as the final validation outcome.
+
+Evidence directory on `pauleyj@192.168.4.44`:
+`/home/pauleyj/alpaca-validation/aux-wifi-aa109c5d-20261015-offline/`.
+Full commands/results: `logs/RESULTS.txt`.
+
+| Source | Native Debug CTest | Native UBSan CTest |
+| --- | --- | --- |
+| Frozen `aa109c5d` | 517/518 | 517/518 |
+| `aa109c5d` plus the new report-test file | 519/520 | 519/520 |
+
+All four full-suite runs fail only **Celestron CGX AUX link - logs the original
+transaction failure once without changing exceptions**, at
+`test_celestron_cgx_protocol.cpp:715,720`. Its qualified USB error-prefix
+expectations differ from the extracted shared AUX implementation. Do not loosen
+those assertions; preserve USB compatibility in the transport before declaring
+this rebase validated or running the physical-driver harness.
+
+Updated-source TSan passed **20 focused cases / 726 assertions** and **7 stress
+cases / 17 assertions**, with no sanitizer reports. ASan remains blocked by the
+known Pi kernel layout. HTTP/package and ConformU were not run. Source verification
+confirmed the only change from the frozen archive was the authorized report-test
+file (SHA-256 `fece37456628fe04e7c8341df0a47225ebba6d658047a66dfbe897cde19206b5`).
+The archive hash is `cc37ccdb18c058cd066c1118a64faace37750a34f08cdda2b834c71e2ef5b577`;
+the validated test-only dirty diff hash is
+`11630e0edc331cf128b17d57b9ae06a7f11662eb665732e6c4e528ff6ae9d321`.
+
+A native standalone lifecycle harness was built under
+`source/AlpacaCore/build-debug/aux_lifecycle_harness` in that isolated directory,
+but **never executed**. Its initial binary hash is
+`4466b3a81e12a4e869d14907ba562900fe74348b33b33862d9beb7f4616a8028`;
+it must be rebuilt and rehashed after the USB diagnostic fix. It uses explicitly
+logged dummy northern site 45/0 for this status-only test, connects, observes idle
+telemetry for about three seconds, then disconnects. It makes no sky-motion calls,
+but its lifecycle calls send takeover stops and require supervision.
+
+### USB-prefix compatibility fix and final native reruns
+
+Changed only `celestron_aux_link.cpp`: serial errors keep their historical USB
+prefix/detail text, while TCP errors retain AUX text. Read/write/poll helpers
+capture transport kind before disconnect cleanup resets it. The existing USB
+regression assertions are unchanged; no timing, state, I/O or error-code behavior
+was changed. The sibling sweep covered serial open/configure/exclusivity/flush,
+TCP connection and queued I/O, exchange parsing/desync, report ACKs and both stops.
+
+Native final evidence is under the preceding isolated directory's
+`logs/usb-prefix-fix-20261016/` (`RESULTS.txt`, `final-source-verification.txt`,
+`final-sha256.txt`, `final-*` logs). Earlier evidence was preserved unchanged.
+
+- Debug CTest: **520/520 passed**, 140.83 s.
+- UBSan CTest: **520/520 passed**, 155.70 s, no sanitizer finding.
+- Original unchanged USB diagnostic case: **60 assertions passed** in each build.
+- Focused TSan: **48 cases / 1,411 assertions passed**.
+- Separate TSan stress: **7 cases / 17 assertions passed**; no race reported.
+- Final production-file SHA-256: `cdd2b1e94bd835b6f10eb734948cc5db35d9bb08e393c7492b7cc01476780ec8`.
+- New report-test file remains `fece37456628fe04e7c8341df0a47225ebba6d658047a66dfbe897cde19206b5`.
+
+The source is `aa109c5d` plus the report tests and USB-prefix fix, **not a clean
+commit**. ASan, full TSan, all-vendor/HTTP/package checks and ConformU remain
+outstanding. An intermediate overlapping-build collision was excluded; final
+recorded runs were rerun without duplicate jobs.
+
+### Supervised SkyPortal lifecycle check — 2026-10-16 01:23:58 UTC
+
+After the final native passes and code review, ran the bounded standalone
+harness under the operator's explicit approval/presence and bare/clear-mount
+confirmation. Rebuilt harness SHA-256:
+`956409ac9c441c93c348978bfc484b508b2f109d1fca4ecb1588ddde59f9f7cf`.
+It used the same validated production source above, host `1.2.3.4:2000`, and
+explicitly logged dummy site 45/0 without writing site settings to hardware.
+
+Results: synchronous Connect **910.469 ms**; firmware `RA 7.18.2214, Dec
+7.18.2214`; Connected true, no link fault, Tracking/Slewing/Guiding false.
+Those states remained unchanged during approximately three seconds of idle
+observation. Explicit Disconnect returned Connected false, no firmware cache and
+no retained fault. Harness result **OK**, exit 0; no timeout occurred. No separate
+Disconnect timing was measured.
+
+This **did send takeover stops** through the real driver on Connect/Disconnect.
+It did not enable tracking, home, Sync, slew, guide, manual motion or Park. The
+installed service/binary/config were untouched. Original WiFi was restored and
+the new temporary profile removed; Ethernet SSH stayed active.
+
+Evidence: remote `/tmp/opencode/skyportal-takeover-20261016-N5Gzyg/`, local
+`/tmp/opencode/skyportal-takeover-evidence-20261016/`; `harness.log` SHA-256
+`b94be006e215ae6cccb2f72f3f8defcb583acac51cf494d0166612492898921f`.
+This is a single **idle lifecycle/takeover check**, not moving-axis deceleration,
+native-guide cancellation, reference/calibration, optical or ConformU qualification.
+
+### Remaining implementation and qualification
+
+After the read-only capture, the operator explicitly authorized motion tests
+when ready, confirmed presence, bare mount/no OTA, clear obstacles/cables and
+no competing controller/client motion or tracking. The bounded idle lifecycle
+check above subsequently passed after native validation. Coordinate-motion
+capabilities remain disabled; moving-axis and guiding takeover still need their
+own supervised evidence.
+
+The [read-only SkyPortal capture](celestron-skyportal-identity.md) on
+2026-10-16 00:11:44 UTC verified both motors' `07 12 08 a6` firmware
+(7.18.2214), model `17 88`, and approach `00` through `1.2.3.4:2000`, source
+`0x20`. The adapter GET_VER at `0xb5` returned only an echo and timed out;
+adapter generation/firmware remain unknown. Original WiFi was restored and
+the temporary profile removed. No deployment, driver Connect/takeover or motion
+occurred. Earlier unprivileged cached scan listings were incorrectly described
+as fresh; a privileged directed scan found the AP. They do not prove its absence.
+
 The Telescope V4 lifecycle-only backend, initial snapshot, fault/lost-state policy,
 narrow firmware cache and catalog selection are implemented. The candidate identity
 profile now validates matching four-byte firmware (including the build high byte)
 and exact two-byte CGX model `0x1788` on both motors. Legacy/mixed replies and
-CGX-L are refused before takeover. These payloads come from USB evidence and
-the fake, not a SkyPortal capture; qualification through SkyPortal remains required
-before rig use. Next come reference/Sync and stop/motion implementation.
+CGX-L are refused before takeover. The candidate was originally USB-sourced and
+fake-tested; the capture above now verifies this northern CGX's identity reply
+shape through SkyPortal. Idle takeover passed the bounded lifecycle check above;
+moving-axis stopping, guide cancellation and coordinate operation remain unqualified.
+Next come reference/Sync and stop/motion implementation.
 Connect must not manufacture a calibrated reference or guessed tracking state.
 
-## Uncommitted review work — 2026-10-14
+## Historical uncommitted review work — 2026-10-14
 
-No new work commits, WiFi pushes or deployment are authorized before user review.
-The USB merge was staged with explicit approval, then replaced by the requested
-upstream-main rebase; all WiFi review edits are now unstaged. Only fork main was pushed.
+At this historical checkpoint, new work commits, WiFi pushes and deployment
+were awaiting user review. The USB merge was staged with explicit approval,
+then replaced by the requested upstream-main rebase. Later explicit approval
+allowed committing and publishing the WiFi work as recorded above; it did not
+authorize deployment or motion tests.
 The clean rebased baseline `a6a0fa2c` passed native arm64 Celestron-enabled Debug
 CTest **480/480** in the isolated source snapshot at
 `/home/pauleyj/alpaca-validation/aux-wifi-review-20261014` on the RPi4. This

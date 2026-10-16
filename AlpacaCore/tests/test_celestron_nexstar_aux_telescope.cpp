@@ -380,6 +380,105 @@ TEST_CASE("Celestron SkyPortal AUX Driver - Faulted telemetry becomes lost witho
     CHECK(fake.requests().size() == requests);
 }
 
+TEST_CASE("Celestron SkyPortal AUX Driver - Low battery reports remain diagnostic-only",
+          "[celestron][nexstar-aux][telescope]") {
+    for (const std::uint8_t axis : {0x10, 0x11}) {
+        INFO("report axis=" << static_cast<int>(axis));
+        test::FakeCelestronAuxServer fake;
+        REQUIRE(fake.ok());
+        fake.enable_cgx_profile();
+        test::FakeTaskClock clock;
+        auto driver = create_celestron_nexstar_aux_telescope(0, info(fake.port()), clock);
+        VirtualDisconnect cleanup{*driver, clock};
+        transition(*driver, clock, true);
+        const auto before = fake.requests().size();
+        fake.report_before_reply({axis, 0x20, 0x50, {0}});
+        clock.advance(1s);
+        REQUIRE(clock.wait_for_woken_settled(2s));
+        CHECK(driver->get_connected());
+        CHECK(driver->get_link_fault().empty());
+        CHECK_FALSE(driver->get_tracking());
+        CHECK_FALSE(driver->get_slewing());
+        const auto requests = fake.requests();
+        REQUIRE(requests.size() == before + 7);  // Six status queries and the report ACK.
+        CHECK(std::count_if(requests.begin() + before, requests.end(), [axis](const auto& frame) {
+                  return frame.source == 0x20 && frame.destination == axis && frame.command == 0x50 &&
+                         frame.payload.empty();
+              }) == 1);
+        clock.advance(1s);
+        REQUIRE(clock.wait_for_woken_settled(2s));
+        CHECK(driver->get_link_fault().empty());
+        CHECK_FALSE(driver->get_tracking());
+        CHECK_FALSE(driver->get_slewing());
+        CHECK(fake.requests().size() == requests.size() + 6);
+    }
+}
+
+TEST_CASE("Celestron SkyPortal AUX Driver - Controller motion reports latch until virtual-time link loss",
+          "[celestron][nexstar-aux][telescope]") {
+    std::uint8_t command = 0x50;
+    std::uint8_t code = 1;
+    SECTION("motion-limit warning") {}
+    SECTION("controller error including code zero") {
+        command = 0x51;
+        code = 0;
+    }
+    for (const std::uint8_t axis : {0x10, 0x11}) {
+        INFO("report axis=" << static_cast<int>(axis) << ", command=" << static_cast<int>(command));
+        test::FakeCelestronAuxServer fake;
+        REQUIRE(fake.ok());
+        fake.enable_cgx_profile();
+        test::FakeTaskClock clock;
+        auto driver = create_celestron_nexstar_aux_telescope(0, info(fake.port()), clock);
+        VirtualDisconnect cleanup{*driver, clock};
+        transition(*driver, clock, true);
+        CHECK_FALSE(driver->get_tracking());
+        CHECK_FALSE(driver->get_slewing());
+        const auto before = fake.requests().size();
+        fake.report_before_reply({axis, 0x20, command, {code}});
+        clock.advance(1s);
+        REQUIRE(clock.wait_for_woken_settled(2s));
+        CHECK(driver->get_connected());
+        const auto fault = driver->get_link_fault();
+        CHECK(fault.find("controller reports a motion limit or error") != std::string::npos);
+        // The previous snapshot is only one second old: its TTL must not hide a known fault.
+        error_code([&] { driver->get_tracking(); }, AlpacaError::DriverException);
+        error_code([&] { driver->get_slewing(); }, AlpacaError::DriverException);
+        const auto requests = fake.requests();
+        REQUIRE(requests.size() == before + 7);
+        CHECK(std::count_if(requests.begin() + before, requests.end(), [axis, command](const auto& frame) {
+                  return frame.source == 0x20 && frame.destination == axis && frame.command == command &&
+                         frame.payload.empty();
+              }) == 1);
+
+        // The fake remains responsive, but a report fault cannot clear itself by polling.
+        for (const auto step : {1s, 28s}) {
+            clock.advance(step);
+            REQUIRE(clock.wait_for_woken_settled(2s));
+            CHECK(driver->get_connected());
+            CHECK_FALSE(driver->get_connecting());
+            CHECK(driver->get_link_fault() == fault);
+            error_code([&] { driver->get_tracking(); }, AlpacaError::DriverException);
+            error_code([&] { driver->get_slewing(); }, AlpacaError::DriverException);
+            CHECK(fake.requests().size() == requests.size());
+        }
+        clock.advance(1s);  // Exactly 30 seconds since the fault latched.
+        REQUIRE(clock.wait_for_woken_settled(2s));
+        CHECK_FALSE(driver->get_connected());
+        CHECK_FALSE(driver->get_connecting());
+        CHECK_FALSE(driver->get_device_firmware());
+        CHECK(driver->get_device_state().empty());
+        CHECK(driver->get_link_fault() == fault);
+        error_code([&] { driver->get_tracking(); }, AlpacaError::NotConnected);
+        error_code([&] { driver->get_slewing(); }, AlpacaError::NotConnected);
+        clock.advance(60s);
+        REQUIRE(clock.wait_for_woken_settled(2s));
+        CHECK_FALSE(driver->get_connected());
+        CHECK(driver->get_link_fault() == fault);
+        CHECK(fake.requests().size() == requests.size());
+    }
+}
+
 TEST_CASE("Celestron SkyPortal AUX Driver - Sync disconnect cannot disappear during a sync connect",
           "[celestron][nexstar-aux][telescope]") {
     test::FakeCelestronAuxServer fake;
