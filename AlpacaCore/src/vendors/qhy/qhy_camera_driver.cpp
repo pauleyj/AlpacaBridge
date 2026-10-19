@@ -921,7 +921,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         expire_overdue_exposure_locked();
         if (!last_exposure_valid_) {
-            throw AlpacaException("No exposure has been taken", AlpacaError::InvalidOperation);
+            throw AlpacaException::asked_too_early("No exposure has been taken");
         }
         if (exposure_status_ == QHYExposureStatus::Success) {
             try {
@@ -942,8 +942,7 @@ public:
         }
         // Still exposing (or idle): there is no image to return, and waiting
         // would hold the HTTP request for the whole exposure.
-        throw AlpacaException("No image is ready; poll ImageReady until the exposure completes",
-                              AlpacaError::InvalidOperation);
+        throw AlpacaException::asked_too_early("No image is ready; poll ImageReady until the exposure completes");
     }
 
     std::string get_image_array_variant() const override {
@@ -2752,9 +2751,14 @@ private:
                             (static_cast<std::size_t>(row) * static_cast<std::size_t>(eff_w) +
                              static_cast<std::size_t>(col)) * 2;
                         if (src + 1 < exposure_buffer_.size()) {
-                            // QHY delivers 16-bit data big-endian
-                            uint16_t val = (static_cast<uint16_t>(exposure_buffer_[src]) << 8) |
-                                            static_cast<uint16_t>(exposure_buffer_[src + 1]);
+                            // GetQHYCCDSingleFrame fills the buffer with native
+                            // little-endian uint16 samples (low byte first), the same
+                            // layout PHD2's cam_qhy and INDI's qhy_ccd read it as. The
+                            // previous high-byte-first read swapped every pixel: a
+                            // QHY5III585M frame came out as noise with ringed stars and
+                            // the guider's star detector found nothing.
+                            uint16_t val = static_cast<uint16_t>(exposure_buffer_[src]) |
+                                           (static_cast<uint16_t>(exposure_buffer_[src + 1]) << 8);
                             image.data[out_idx] = static_cast<std::int32_t>(val);
                         }
                     }

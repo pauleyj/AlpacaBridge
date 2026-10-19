@@ -462,13 +462,13 @@ const DeviceKey kPlayerOneCameraKey{"playerone", DeviceType::Camera};
 const DeviceKey kPlayerOneWheelKey{"playerone", DeviceType::FilterWheel};
 const DeviceKey kPlayerOneSwitchKey{"playerone", DeviceType::Switch};
 
-void check_index_field(const FieldRef& f, std::string_view key) {
+void check_index_field(const FieldRef& f, std::string_view key, double min = 0.0) {
     CHECK(std::string_view(f.key) == key);
     CHECK(f.kind == FieldRef::Kind::Int);
     CHECK(f.role == Role::EnumerationIndex);
     CHECK_FALSE(f.required);
     REQUIRE(f.min.has_value());
-    CHECK(*f.min == 0.0);
+    CHECK(*f.min == min);
     REQUIRE(f.max.has_value());
     CHECK(*f.max == static_cast<double>(std::numeric_limits<int>::max()));
     REQUIRE(std::holds_alternative<std::int64_t>(f.default_value));
@@ -481,11 +481,17 @@ TEST_CASE("Builtin catalog - Player One index range refuses values the int cast 
           "[catalog][playerone][unit]") {
     DeviceCatalog catalog;
     register_builtin_schemas(catalog);
-    const std::pair<DeviceKey, const char*> targets[]{{kPlayerOneCameraKey, "cameraIndex"},
-                                                      {kPlayerOneSwitchKey, "cameraIndex"},
-                                                      {kPlayerOneWheelKey, "filterwheelIndex"}};
-    for (const auto& [key, field] : targets) {
-        for (const std::int64_t bad : {std::int64_t{1} << 31, std::int64_t{-1}}) {
+    // The thermal switch also takes -1, Auto (the one camera with a heater or fan).
+    struct Target {
+        DeviceKey key;
+        const char* field;
+        std::int64_t lowest;
+    };
+    const Target targets[]{{kPlayerOneCameraKey, "cameraIndex", 0},
+                           {kPlayerOneSwitchKey, "cameraIndex", -1},
+                           {kPlayerOneWheelKey, "filterwheelIndex", 0}};
+    for (const auto& [key, field, lowest] : targets) {
+        for (const std::int64_t bad : {std::int64_t{1} << 31, lowest - 1}) {
             INFO(std::string(field) + " = " + std::to_string(bad));
             DeviceConfig config;
             config.set(field, bad);
@@ -498,12 +504,36 @@ TEST_CASE("Builtin catalog - Player One index range refuses values the int cast 
             CHECK_FALSE(persisted.config.has(field));
             CHECK_FALSE(persisted.warnings.empty());
         }
-        for (const std::int64_t good : {std::int64_t{0}, std::int64_t{std::numeric_limits<int>::max()}}) {
+        for (const std::int64_t good : {lowest, std::int64_t{0}, std::int64_t{std::numeric_limits<int>::max()}}) {
             DeviceConfig config;
             config.set(field, good);
             CHECK_FALSE(catalog.normalize(key, config, Source::Api).rejection.has_value());
         }
     }
+}
+
+TEST_CASE("Builtin catalog - Player One switch serial refuses control bytes and keeps a clean one",
+          "[catalog][playerone][unit]") {
+    DeviceCatalog catalog;
+    register_builtin_schemas(catalog);
+    DeviceConfig forged;
+    forged.set("cameraIndex", std::int64_t{1});
+    forged.set("serialNumber", std::string("POA\nforged"));
+    const auto api = catalog.normalize(kPlayerOneSwitchKey, forged, Source::Api);
+    REQUIRE(api.rejection.has_value());
+    CHECK(api.rejection->find("serialNumber") != std::string::npos);
+    // A stored entry loses the serial, keeps its index, and still registers.
+    const auto persisted = catalog.normalize(kPlayerOneSwitchKey, forged, Source::Persisted);
+    CHECK_FALSE(persisted.rejection.has_value());
+    CHECK_FALSE(persisted.config.has("serialNumber"));
+    CHECK(persisted.config.has("cameraIndex"));
+    CHECK_FALSE(persisted.warnings.empty());
+
+    DeviceConfig clean;
+    clean.set("serialNumber", std::string("POA0123456"));
+    const auto ok = catalog.normalize(kPlayerOneSwitchKey, clean, Source::Api);
+    CHECK_FALSE(ok.rejection.has_value());
+    CHECK(ok.config.has("serialNumber"));
 }
 
 TEST_CASE("Builtin catalog - register_builtin_schemas describes the Player One devices in every build",
@@ -523,10 +553,13 @@ TEST_CASE("Builtin catalog - register_builtin_schemas describes the Player One d
     const DescriptorView* camera = find_view(views, kPlayerOneCameraKey);
     REQUIRE(camera->fields.size() == 1);
     check_index_field(camera->fields[0], "cameraIndex");
-    // The thermal switch binds to a camera by its index.
+    // The thermal switch binds to a camera by its index (-1 is Auto) or its serial.
     const DescriptorView* sw = find_view(views, kPlayerOneSwitchKey);
-    REQUIRE(sw->fields.size() == 1);
-    check_index_field(sw->fields[0], "cameraIndex");
+    REQUIRE(sw->fields.size() == 2);
+    check_index_field(sw->fields[0], "cameraIndex", -1.0);
+    CHECK(std::string_view(sw->fields[1].key) == "serialNumber");
+    CHECK(sw->fields[1].kind == FieldRef::Kind::String);
+    CHECK_FALSE(sw->fields[1].required);
 
     const DescriptorView* wheel = find_view(views, kPlayerOneWheelKey);
     REQUIRE(wheel->fields.size() == 2);
@@ -856,7 +889,11 @@ TEST_CASE("Builtin catalog - register_builtin_schemas describes the SkyWatcher t
                                                       "focalLength",
                                                       "minAltitudeDeg",
                                                       "meridianLimitMinutes",
-                                                      "decAxisSense"};
+                                                      "decAxisSense",
+                                                      "backlashStepsRA",
+                                                      "backlashEnabledRA",
+                                                      "backlashStepsDec",
+                                                      "backlashEnabledDec"};
     REQUIRE(v->fields.size() == expected_keys.size());
     for (std::size_t i = 0; i < expected_keys.size(); ++i) {
         CHECK(std::string_view(v->fields[i].key) == expected_keys[i]);
@@ -887,6 +924,10 @@ TEST_CASE("Builtin catalog - register_builtin_schemas describes the SkyWatcher t
         {"minAltitudeDeg", FieldRef::Kind::Double, Role::Plain, std::nullopt, 0.0, -90.0, 90.0},
         {"meridianLimitMinutes", FieldRef::Kind::Double, Role::Plain, std::nullopt, 0.0, 0.0, 360.0},
         {"decAxisSense", FieldRef::Kind::String, Role::Plain, std::nullopt, std::string{"auto"}, {}, {}},
+        {"backlashStepsRA", FieldRef::Kind::Int, Role::Plain, std::nullopt, std::int64_t{0}, 0.0, 100000.0},
+        {"backlashEnabledRA", FieldRef::Kind::Bool, Role::Plain, std::nullopt, false, {}, {}},
+        {"backlashStepsDec", FieldRef::Kind::Int, Role::Plain, std::nullopt, std::int64_t{0}, 0.0, 100000.0},
+        {"backlashEnabledDec", FieldRef::Kind::Bool, Role::Plain, std::nullopt, false, {}, {}},
     };
     for (const Expect& e : expectations) {
         INFO(e.key);
@@ -2278,7 +2319,9 @@ TEST_CASE("Builtin catalog - register_builtin_factories makes the QHY devices av
     DeviceConfig no_port;
     no_port.set("wheelType", std::string{"cfw3-usb"});
     no_port.set("connectionType", std::string{"serial"});
-    CHECK_THROWS_AS(catalog.create(kQhyWheelKey, no_port, 9), AlpacaException);
+    // #508 item 1: built anyway so a saved entry stays registered; its connect refuses (the wheel's
+    // own test pins the text).
+    CHECK(catalog.create(kQhyWheelKey, no_port, 9) != nullptr);
     CHECK_THROWS_AS(catalog.create(kQhyCameraKey, DeviceConfig{}, 10), AlpacaException);
 #endif
 }
@@ -2778,11 +2821,14 @@ TEST_CASE("Builtin catalog - register_builtin_factories makes the Gemini devices
     hub_serial.set("portPath", std::string{"/dev/ttyUSB-no-such-gemini"});
     REQUIRE(catalog.create(kGeminiSwitchKey, hub_serial, 9) != nullptr);
 
-    // A saved config normalize could only warn about is refused here, never
-    // built into a hub that would auto-detect behind the user's back.
+    // A serial hub with no port is built (#508 item 1) so a saved entry stays registered, but
+    // never into a hub that would auto-detect behind the user's back: its connect refuses.
     DeviceConfig hub_no_port;
     hub_no_port.set("connectionType", std::string{"serial"});
-    CHECK_THROWS_AS(catalog.create(kGeminiSwitchKey, hub_no_port, 10), AlpacaException);
+    auto hub_unported = catalog.create(kGeminiSwitchKey, hub_no_port, 10);
+    REQUIRE(hub_unported != nullptr);
+    CHECK_THROWS_AS(hub_unported->set_connected(true), AlpacaException);
+    CHECK_FALSE(hub_unported->get_connected());
     DeviceConfig hub_bad_type;
     hub_bad_type.set("switchType", std::string{"not-a-backend"});
     CHECK_THROWS_AS(catalog.create(kGeminiSwitchKey, hub_bad_type, 11), AlpacaException);
@@ -2943,10 +2989,14 @@ TEST_CASE("Builtin catalog - register_builtin_factories makes the WandererAstro 
         serial.set("portPath", std::string{"/dev/ttyUSB-no-such-wanderer"});
         REQUIRE(catalog.create(key, serial, 4) != nullptr);
 
-        // Serial mode means an explicit port: no silent auto-detect.
+        // Serial mode means an explicit port: no silent auto-detect. A saved entry with none is
+        // still built (#508 item 1) and its connect refuses naming portPath.
         DeviceConfig no_port;
         no_port.set("connectionType", std::string{"serial"});
-        CHECK_THROWS_AS(catalog.create(key, no_port, 5), AlpacaException);
+        auto unported = catalog.create(key, no_port, 5);
+        REQUIRE(unported != nullptr);
+        CHECK_THROWS_AS(unported->set_connected(true), AlpacaException);
+        CHECK_FALSE(unported->get_connected());
     }
 
     DeviceConfig names;
@@ -3098,7 +3148,7 @@ TEST_CASE("Builtin catalog - register_builtin_schemas describes the ZWO devices 
           std::vector<std::string>{"focuserIndex", "focuserId", "maxStep"});
     CHECK(keys_of(find_view(views, kZwoRotatorKey)) == std::vector<std::string>{"rotatorIndex", "rotatorId"});
     CHECK(keys_of(find_view(views, kZwoSwitchKey)) == std::vector<std::string>{"switchType", "cameraIndex", "cameraId",
-                                                                               "gpioChip", "devicePath",
+                                                                               "serialNumber", "gpioChip", "devicePath",
                                                                                "pwmFrequencyHz", "ports"});
     CHECK(find_field(find_view(views, kZwoWheelKey)->fields, "filterNames")->kind == FieldRef::Kind::StringList);
     CHECK(find_field(find_view(views, kZwoSwitchKey)->fields, "ports")->kind == FieldRef::Kind::RecordList);
@@ -3230,7 +3280,11 @@ TEST_CASE("Builtin catalog - ZWO normalize keeps the arms' refusals and texts", 
     CHECK(refusal_of(kZwoWheelKey, DeviceConfig{}) == "ZWO filter wheel requires filterwheelIndex or filterwheelId");
     CHECK(refusal_of(kZwoFocuserKey, DeviceConfig{}) == "ZWO EAF focuser requires focuserIndex or focuserId");
     CHECK(refusal_of(kZwoRotatorKey, DeviceConfig{}) == "ZWO rotator requires rotatorIndex or rotatorId");
-    CHECK(refusal_of(kZwoSwitchKey, DeviceConfig{}) == "ZWO dew heater switch requires cameraIndex or cameraId");
+    // A dew heater with no camera selector is Auto, so nothing is refused; a non-hex serial is.
+    CHECK(refusal_of(kZwoSwitchKey, DeviceConfig{}).empty());
+    DeviceConfig forged_serial;
+    forged_serial.set("serialNumber", std::string{"not-hex"});
+    CHECK(refusal_of(kZwoSwitchKey, forged_serial) == "Invalid value for serialNumber");
     CHECK(refusal_of(kZwoCameraKey, DeviceConfig{}) == "ZWO camera requires cameraIndex or cameraId");
 
     DeviceConfig index;
@@ -3287,17 +3341,22 @@ TEST_CASE("Builtin catalog - ZWO telescope connection type and endpoint rules", 
     DeviceCatalog catalog;
     register_builtin_schemas(catalog);
 
-    // An absent connectionType is not "auto" for this mount: refused from the API, read as serial when saved.
-    const auto absent_api = catalog.normalize(kZwoTelescopeKey, DeviceConfig{}, Source::Api);
-    REQUIRE(absent_api.rejection.has_value());
-    CHECK(*absent_api.rejection == "Invalid connection type. Use 'serial', 'network', or 'auto'");
-    const auto absent_saved = catalog.normalize(kZwoTelescopeKey, DeviceConfig{}, Source::Persisted);
-    CHECK_FALSE(absent_saved.rejection.has_value());
-    REQUIRE_FALSE(absent_saved.warnings.empty());
-    CHECK(absent_saved.warnings.front().find("has connectionType") != std::string::npos);
-    const ConfigValue* read_as = absent_saved.config.find_value("connectionType");
-    REQUIRE(read_as != nullptr);
-    CHECK(std::get<std::string>(*read_as) == "serial");
+    // An empty or absent connectionType is "auto" for every mount, this one included (#508 item 3): accepted from
+    // the API and read as auto when saved, with no "not one this driver knows" warning.
+    const auto type_of = [](const NormalizeResult& r) {
+        const ConfigValue* v = r.config.find_value("connectionType");
+        return v ? std::get<std::string>(*v) : std::string{"<unset>"};
+    };
+    DeviceConfig empty_type;
+    empty_type.set("connectionType", std::string{});
+    for (const DeviceConfig& config : {DeviceConfig{}, empty_type}) {
+        for (const Source source : {Source::Api, Source::Persisted}) {
+            const auto result = catalog.normalize(kZwoTelescopeKey, config, source);
+            CHECK_FALSE(result.rejection.has_value());
+            CHECK(result.warnings.empty());
+            CHECK(type_of(result) == "auto");
+        }
+    }
 
     DeviceConfig autod;
     autod.set("connectionType", std::string{"auto"});
@@ -3318,7 +3377,15 @@ TEST_CASE("Builtin catalog - ZWO telescope connection type and endpoint rules", 
 
     DeviceConfig bogus;
     bogus.set("connectionType", std::string{"usb"});
-    CHECK(catalog.normalize(kZwoTelescopeKey, bogus, Source::Api).rejection.has_value());
+    const auto bogus_api = catalog.normalize(kZwoTelescopeKey, bogus, Source::Api);
+    REQUIRE(bogus_api.rejection.has_value());
+    CHECK(*bogus_api.rejection == "Invalid connection type. Use 'serial', 'network', or 'auto'");
+    // A non-empty unknown saved value is unchanged: warned about and read as serial.
+    const auto bogus_saved = catalog.normalize(kZwoTelescopeKey, bogus, Source::Persisted);
+    CHECK_FALSE(bogus_saved.rejection.has_value());
+    REQUIRE_FALSE(bogus_saved.warnings.empty());
+    CHECK(bogus_saved.warnings.front().find("has connectionType \"usb\"") != std::string::npos);
+    CHECK(type_of(bogus_saved) == "serial");
 }
 
 TEST_CASE("Builtin catalog - ZWO sanitize keeps the declared fields per device type", "[catalog][zwo][unit]") {
@@ -3511,4 +3578,321 @@ TEST_CASE("Builtin catalog - connectionType is folded to lower case (#508 item 2
     REQUIRE(no_host.rejection.has_value());
     CHECK(*no_host.rejection == "Host IP address is required");
     CHECK(folded("Carrier-Pigeon", Source::Api).rejection.has_value());
+}
+
+// ---------------------------------------------------------------------------
+// iOptron telescope, iMate PowerBox switch, iEAF focuser, iEFW filter wheel and
+// iCAM camera. Every auto-detect factory constructs without a scan (#659), so no
+// port is opened here.
+// ---------------------------------------------------------------------------
+
+namespace {
+const DeviceKey kIoptronTelescopeKey{"ioptron", DeviceType::Telescope};
+const DeviceKey kIoptronSwitchKey{"ioptron", DeviceType::Switch};
+const DeviceKey kIoptronFocuserKey{"ioptron", DeviceType::Focuser};
+const DeviceKey kIoptronFilterWheelKey{"ioptron", DeviceType::FilterWheel};
+const DeviceKey kIoptronCameraKey{"ioptron", DeviceType::Camera};
+}  // namespace
+
+TEST_CASE("Builtin catalog - register_builtin_schemas describes the iOptron devices in every build",
+          "[catalog][ioptron][unit]") {
+    DeviceCatalog catalog;
+    register_builtin_schemas(catalog);
+    const auto views = catalog.describe();
+
+    const auto keys_of = [](const DescriptorView* v) {
+        std::vector<std::string> keys;
+        for (const FieldRef& f : v->fields) keys.emplace_back(f.key);
+        return keys;
+    };
+    for (const DeviceKey& key : {kIoptronTelescopeKey, kIoptronSwitchKey, kIoptronFocuserKey, kIoptronFilterWheelKey}) {
+        const DescriptorView* v = find_view(views, key);
+        REQUIRE(v != nullptr);
+        CHECK(v->build_option == "ALPACACORE_ENABLE_IOPTRON");
+        CHECK_FALSE(v->available);  // schemas only: no factory has been registered yet
+    }
+    // The iCAM is a rebadged Player One: it follows that option, not the iOptron one.
+    const DescriptorView* camera = find_view(views, kIoptronCameraKey);
+    REQUIRE(camera != nullptr);
+    CHECK(camera->build_option == "ALPACACORE_ENABLE_PLAYERONE");
+    CHECK_FALSE(camera->available);
+    CHECK(keys_of(camera) == std::vector<std::string>{"cameraIndex"});
+    // No range: the arm this replaces never validated the index.
+    CHECK_FALSE(find_field(camera->fields, "cameraIndex")->min.has_value());
+
+    CHECK(keys_of(find_view(views, kIoptronTelescopeKey)) ==
+          std::vector<std::string>{"connectionType", "mountIndex", "portPath", "baudRate", "host", "tcpPort",
+                                   "responseTimeoutMs", "siteLatitude", "siteLongitude", "siteElevation",
+                                   "syncTimeOnConnect", "apertureDiameter", "focalLength"});
+    CHECK(keys_of(find_view(views, kIoptronSwitchKey)) ==
+          std::vector<std::string>{"gpioChip", "pwmFrequencyHz", "ports"});
+    CHECK(keys_of(find_view(views, kIoptronFocuserKey)) ==
+          std::vector<std::string>{"connectionType", "portPath", "focuserIndex", "model"});
+    CHECK(keys_of(find_view(views, kIoptronFilterWheelKey)) ==
+          std::vector<std::string>{"connectionType", "portPath", "filterwheelIndex", "model", "filterNames"});
+
+    const DescriptorView* telescope = find_view(views, kIoptronTelescopeKey);
+    CHECK(same_scalar(find_field(telescope->fields, "baudRate")->default_value, std::int64_t{115200}));
+    CHECK(same_scalar(find_field(telescope->fields, "tcpPort")->default_value, std::int64_t{4030}));
+    CHECK(same_scalar(find_field(telescope->fields, "responseTimeoutMs")->default_value, std::int64_t{5000}));
+    CHECK(same_scalar(find_field(find_view(views, kIoptronFocuserKey)->fields, "model")->default_value,
+                      std::string{"ieaf"}));
+    CHECK(same_scalar(find_field(find_view(views, kIoptronFilterWheelKey)->fields, "model")->default_value,
+                      std::string{"iefw15"}));
+    CHECK(same_scalar(find_field(find_view(views, kIoptronSwitchKey)->fields, "gpioChip")->default_value,
+                      std::string{"/dev/gpiochip1"}));
+    const FieldRef* ports = find_field(find_view(views, kIoptronSwitchKey)->fields, "ports");
+    REQUIRE(ports != nullptr);
+    CHECK(ports->kind == FieldRef::Kind::RecordList);
+    const FieldRef* names = find_field(find_view(views, kIoptronFilterWheelKey)->fields, "filterNames");
+    REQUIRE(names != nullptr);
+    CHECK(names->kind == FieldRef::Kind::StringList);
+}
+
+TEST_CASE("Builtin catalog - register_builtin_factories makes the iOptron devices available only when built",
+          "[catalog][ioptron][unit]") {
+    const DeviceCatalog catalog = builtin_catalog();
+    const auto views = catalog.describe();
+    for (const DeviceKey& key : {kIoptronTelescopeKey, kIoptronSwitchKey, kIoptronFocuserKey, kIoptronFilterWheelKey}) {
+        const DescriptorView* v = find_view(views, key);
+        REQUIRE(v != nullptr);
+#ifdef ALPACACORE_ENABLE_IOPTRON
+        CHECK(v->available);
+#else
+        CHECK_FALSE(v->available);
+        try {
+            (void)catalog.create(key, DeviceConfig{}, 0);
+            FAIL("create() must throw when iOptron is not built");
+        } catch (const std::runtime_error& e) {
+            CHECK(std::string(e.what()).find("ALPACACORE_ENABLE_IOPTRON") != std::string::npos);
+        }
+#endif
+    }
+    const DescriptorView* camera = find_view(views, kIoptronCameraKey);
+    REQUIRE(camera != nullptr);
+#ifdef ALPACACORE_ENABLE_PLAYERONE
+    CHECK(camera->available);
+#else
+    CHECK_FALSE(camera->available);
+    try {
+        (void)catalog.create(kIoptronCameraKey, DeviceConfig{}, 0);
+        FAIL("create() must throw when Player One is not built");
+    } catch (const std::runtime_error& e) {
+        CHECK(std::string(e.what()).find("ALPACACORE_ENABLE_PLAYERONE") != std::string::npos);
+    }
+#endif
+#ifdef ALPACACORE_ENABLE_IOPTRON
+    // Nothing here opens a port: the auto paths resolve at connect (#659).
+    for (const char* type : {"auto", "serial", "network"}) {
+        DeviceConfig config;
+        config.set("connectionType", std::string{type});  // serial: no port yet; network: no host, sweeps at connect
+        auto telescope = catalog.create(kIoptronTelescopeKey, config, 3);
+        REQUIRE(telescope != nullptr);
+        CHECK(telescope->get_device_type() == DeviceType::Telescope);
+        CHECK(telescope->get_device_number() == 3);
+        CHECK_FALSE(telescope->get_connected());
+    }
+    DeviceConfig serial_focuser;
+    serial_focuser.set("connectionType", std::string{"serial"});
+    serial_focuser.set("portPath", std::string{"/dev/ttyUSB-no-such-ioptron"});
+    serial_focuser.set("model", std::string{"iafs2"});
+    auto focuser = catalog.create(kIoptronFocuserKey, serial_focuser, 4);
+    REQUIRE(focuser != nullptr);
+    CHECK(focuser->get_device_type() == DeviceType::Focuser);
+    // Serial with no port falls back to auto-detect, as the router arm did.
+    DeviceConfig focuser_no_port;
+    focuser_no_port.set("connectionType", std::string{"serial"});
+    REQUIRE(catalog.create(kIoptronFocuserKey, focuser_no_port, 5) != nullptr);
+
+    auto wheel = catalog.create(kIoptronFilterWheelKey, DeviceConfig{}, 6);
+    REQUIRE(wheel != nullptr);
+    CHECK(wheel->get_device_type() == DeviceType::FilterWheel);
+    DeviceConfig named_wheel;
+    named_wheel.set("filterNames", std::vector<std::string>{"L", "R", "G"});
+    auto named = catalog.create(kIoptronFilterWheelKey, named_wheel, 7);
+    REQUIRE(named != nullptr);
+    CHECK(named->get_device_number() == 7);
+    // The factory refuses what normalize refuses: a serial wheel with no port.
+    DeviceConfig wheel_no_port;
+    wheel_no_port.set("connectionType", std::string{"serial"});
+    CHECK_THROWS_AS(catalog.create(kIoptronFilterWheelKey, wheel_no_port, 8), AlpacaException);
+
+    // The switch is registered whether or not libgpiod was found.
+    DeviceConfig sw;
+    sw.set("gpioChip", std::string{"/dev/gpiochip7"});
+#ifdef ALPACACORE_IOPTRON_POWERBOX
+    try {
+        (void)catalog.create(kIoptronSwitchKey, sw, 9);
+        FAIL("a gpioChip off the board's list must be refused");
+    } catch (const AlpacaException& e) {
+        CHECK(std::string(e.what()).find("gpioChip") != std::string::npos);
+    }
+    DeviceConfig ports_cfg;
+    DeviceConfig port;
+    port.set("name", std::string{"Mount"});
+    port.set("pwm", true);
+    ports_cfg.set("ports", std::vector<DeviceConfig>{DeviceConfig{}, port});
+    auto hub = catalog.create(kIoptronSwitchKey, ports_cfg, 10);
+    REQUIRE(hub != nullptr);
+    CHECK(hub->get_device_type() == DeviceType::Switch);
+#else
+    try {
+        (void)catalog.create(kIoptronSwitchKey, sw, 9);
+        FAIL("the PowerBox is not built here");
+    } catch (const AlpacaException& e) {
+        CHECK(std::string(e.what()).find("iMate PowerBox switch not built") != std::string::npos);
+    }
+#endif
+#endif
+}
+
+TEST_CASE("Builtin catalog - iOptron telescope normalize keeps the arm's refusals and texts",
+          "[catalog][ioptron][unit]") {
+    DeviceCatalog catalog;
+    register_builtin_schemas(catalog);
+
+    // An unknown connectionType: refused from the API, read as serial when saved (#380).
+    DeviceConfig bad_type;
+    bad_type.set("connectionType", std::string{"carrier-pigeon"});
+    const auto bad = catalog.normalize(kIoptronTelescopeKey, bad_type, Source::Api);
+    REQUIRE(bad.rejection.has_value());
+    CHECK(*bad.rejection == "Invalid connection type. Use 'auto', 'serial', or 'network'");
+    const auto saved = catalog.normalize(kIoptronTelescopeKey, bad_type, Source::Persisted);
+    CHECK_FALSE(saved.rejection.has_value());
+    CHECK(string_at(saved.config, "connectionType") == "serial");
+    REQUIRE_FALSE(saved.warnings.empty());
+
+    // "", auto and network pass with no endpoint: an empty network host sweeps the subnet at connect.
+    for (const char* type : {"", "auto", "network"}) {
+        DeviceConfig config;
+        config.set("connectionType", std::string{type});
+        const auto result = catalog.normalize(kIoptronTelescopeKey, config, Source::Api);
+        INFO(type);
+        CHECK_FALSE(result.rejection.has_value());
+        CHECK(result.warnings.empty());
+    }
+
+    // Serial needs a port from the API; a saved one is warned about and kept.
+    DeviceConfig serial;
+    serial.set("connectionType", std::string{"serial"});
+    const auto serial_api = catalog.normalize(kIoptronTelescopeKey, serial, Source::Api);
+    REQUIRE(serial_api.rejection.has_value());
+    CHECK(*serial_api.rejection == "Serial port path is required");
+    const auto serial_saved = catalog.normalize(kIoptronTelescopeKey, serial, Source::Persisted);
+    CHECK_FALSE(serial_saved.rejection.has_value());
+    CHECK(serial_saved.warnings == std::vector<std::string>{"Serial port path is required"});
+
+    // The site range is checked first, per field, with the router's wording.
+    DeviceConfig site;
+    site.set("connectionType", std::string{"carrier-pigeon"});
+    site.set("siteLatitude", 200.0);
+    site.set("siteLongitude", -33.0);
+    const auto site_api = catalog.normalize(kIoptronTelescopeKey, site, Source::Api);
+    REQUIRE(site_api.rejection.has_value());
+    CHECK(*site_api.rejection == "siteLatitude 200 is out of range: must be between -90 and 90 degrees");
+    const auto site_saved = catalog.normalize(kIoptronTelescopeKey, site, Source::Persisted);
+    CHECK_FALSE(site_saved.rejection.has_value());
+    CHECK(site_saved.config.find_value("siteLatitude") == nullptr);   // dropped to unset
+    CHECK(site_saved.config.find_value("siteLongitude") != nullptr);  // the in-range one stays
+    site.set("siteLatitude", -90.0);
+    site.set("siteLongitude", 180.5);
+    const auto longitude = catalog.normalize(kIoptronTelescopeKey, site, Source::Api);
+    REQUIRE(longitude.rejection.has_value());
+    CHECK(*longitude.rejection == "siteLongitude 180.5 is out of range: must be between -180 and 180 degrees");
+    // No range on the elevation, as the arm had none.
+    DeviceConfig elevation;
+    elevation.set("connectionType", std::string{"auto"});
+    elevation.set("siteElevation", 99999.0);
+    CHECK_FALSE(catalog.normalize(kIoptronTelescopeKey, elevation, Source::Api).rejection.has_value());
+}
+
+TEST_CASE("Builtin catalog - iOptron filter wheel and PowerBox normalize refuse what the arms refused",
+          "[catalog][ioptron][unit]") {
+    DeviceCatalog catalog;
+    register_builtin_schemas(catalog);
+
+    CHECK_FALSE(catalog.normalize(kIoptronFilterWheelKey, DeviceConfig{}, Source::Api).rejection.has_value());
+    DeviceConfig no_port;
+    no_port.set("connectionType", std::string{"serial"});
+    const auto no_port_api = catalog.normalize(kIoptronFilterWheelKey, no_port, Source::Api);
+    REQUIRE(no_port_api.rejection.has_value());
+    CHECK(*no_port_api.rejection == "portPath is required when connectionType is 'serial' (or use 'auto').");
+    DeviceConfig negative;
+    negative.set("filterwheelIndex", std::int64_t{-1});
+    const auto negative_api = catalog.normalize(kIoptronFilterWheelKey, negative, Source::Api);
+    REQUIRE(negative_api.rejection.has_value());
+    CHECK(*negative_api.rejection == "filterwheelIndex must be >= 0.");
+    // The index only matters off the serial path, as before.
+    negative.set("connectionType", std::string{"serial"});
+    negative.set("portPath", std::string{"/dev/ttyUSB1"});
+    CHECK_FALSE(catalog.normalize(kIoptronFilterWheelKey, negative, Source::Api).rejection.has_value());
+
+#ifdef ALPACACORE_IOPTRON_POWERBOX
+    DeviceConfig sw;
+    sw.set("gpioChip", std::string{"/dev/gpiochip0"});  // the stock BSP kernel's name for the bank
+    CHECK_FALSE(catalog.normalize(kIoptronSwitchKey, sw, Source::Api).rejection.has_value());
+    sw.set("gpioChip", std::string{"/dev/mem"});
+    const auto bad_chip = catalog.normalize(kIoptronSwitchKey, sw, Source::Api);
+    REQUIRE(bad_chip.rejection.has_value());
+    CHECK(bad_chip.rejection->find("gpioChip") != std::string::npos);
+    CHECK(bad_chip.rejection->find("'/dev/gpiochip1' or '/dev/gpiochip0'") != std::string::npos);
+#endif
+}
+
+TEST_CASE("Builtin catalog - iOptron sanitize keeps the declared fields per device type", "[catalog][ioptron][unit]") {
+    DeviceCatalog catalog;
+    register_builtin_schemas(catalog);
+
+    DeviceConfig focuser;
+    focuser.set("connectionType", std::string{"auto"});
+    focuser.set("portPath", std::string{"/dev/ttyUSB7"});
+    focuser.set("focuserIndex", std::int64_t{2});
+    focuser.set("model", std::string{"iafs2"});
+    focuser.set("baudRate", std::int64_t{9});  // the focuser has a fixed baud
+    focuser.set("filterwheelIndex", std::int64_t{1});
+    const DeviceConfig kept_focuser = catalog.sanitize(kIoptronFocuserKey, focuser);
+    CHECK(kept_focuser.has("portPath"));  // a declared field is kept whatever connectionType is (ADR 0004)
+    CHECK(kept_focuser.has("focuserIndex"));
+    CHECK(string_at(kept_focuser, "model") == "iafs2");
+    CHECK_FALSE(kept_focuser.has("baudRate"));
+    CHECK_FALSE(kept_focuser.has("filterwheelIndex"));
+
+    DeviceConfig port;
+    port.set("name", std::string{"Camera"});
+    port.set("pwm", true);
+    port.set("bogusKey", std::int64_t{1});
+    DeviceConfig sw;
+    sw.set("gpioChip", std::string{"/dev/gpiochip1"});
+    sw.set("pwmFrequencyHz", std::int64_t{100});
+    sw.set("ports", std::vector<DeviceConfig>{port});
+    sw.set("cameraIndex", std::int64_t{1});
+    const DeviceConfig kept_switch = catalog.sanitize(kIoptronSwitchKey, sw);
+    CHECK(kept_switch.has("gpioChip"));
+    CHECK(kept_switch.has("pwmFrequencyHz"));
+    CHECK_FALSE(kept_switch.has("cameraIndex"));
+    const ConfigValue* ports_value = kept_switch.find_value("ports");
+    REQUIRE(ports_value != nullptr);
+    const auto* kept_ports = std::get_if<std::vector<DeviceConfig>>(ports_value);
+    REQUIRE(kept_ports != nullptr);
+    REQUIRE(kept_ports->size() == 1);
+    CHECK((*kept_ports)[0].has("name"));
+    CHECK((*kept_ports)[0].has("pwm"));
+    CHECK_FALSE((*kept_ports)[0].has("bogusKey"));
+
+    DeviceConfig wheel;
+    wheel.set("connectionType", std::string{"serial"});
+    wheel.set("portPath", std::string{"/dev/ttyUSB8"});
+    wheel.set("filterNames", std::vector<std::string>{"L", "R"});
+    wheel.set("host", std::string{"h"});
+    const DeviceConfig kept_wheel = catalog.sanitize(kIoptronFilterWheelKey, wheel);
+    CHECK(kept_wheel.has("filterNames"));
+    CHECK(kept_wheel.has("portPath"));
+    CHECK_FALSE(kept_wheel.has("host"));
+
+    DeviceConfig camera;
+    camera.set("cameraIndex", std::int64_t{2});
+    camera.set("connectionType", std::string{"serial"});
+    const DeviceConfig kept_camera = catalog.sanitize(kIoptronCameraKey, camera);
+    CHECK(kept_camera.has("cameraIndex"));
+    CHECK_FALSE(kept_camera.has("connectionType"));
 }

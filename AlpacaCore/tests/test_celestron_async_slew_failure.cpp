@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -79,6 +80,7 @@ struct FakeCelestronState {
     std::atomic<int> mc_slew_status_polls{0};
     std::atomic<bool> invalid_next_home_status{false};
     std::atomic<bool> mute{false};
+    std::atomic<bool> tracking_on{true};      // what the 't' query answers: EQ-North when on, Off when not
     std::atomic<unsigned char> model_id{24};  // CGX-L
     std::atomic<unsigned char> firmware_major{5};
     std::atomic<unsigned char> firmware_minor{35};
@@ -170,6 +172,8 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(const std::shar
                 return "1#";
             case 'p':  // pier side used by the DEC guide command
                 return "W#";
+            case 't':  // tracking mode query
+                return st->tracking_on.load() ? std::string("\x02#") : std::string("\x00#", 2);
             case 'T':
                 if (st->reject_next_tracking_write.exchange(false)) return "";
                 return "#";
@@ -241,6 +245,34 @@ bool advance_until(alpacacore::test::FakeTaskClock& clock, const std::function<b
     return pred();
 }
 
+// Runs a blocking driver call on its own thread, stepping the clock until it returns, then rethrows what it threw.
+// `started` must hold, on real time, before the first step: a task parked on the clock from before the call (a pulse
+// timer the call reaps) would otherwise satisfy the rendezvous while the call is still on the socket, and virtual
+// time would run ahead of it.
+template <typename Fn>
+void run_virtual(alpacacore::test::FakeTaskClock& clock, Fn&& fn, const std::function<bool()>& started) {
+    std::exception_ptr error;
+    std::atomic<bool> done{false};
+    std::thread caller([&] {
+        try {
+            fn();
+        } catch (...) {
+            error = std::current_exception();
+        }
+        done.store(true);
+    });
+    const bool began = wait_until([&] { return started() || done.load(); }, 5000);
+    const bool finished = began && advance_until(clock, [&] { return done.load(); });
+    while (!done.load()) {
+        clock.advance(std::chrono::hours(1));  // release a hung caller (it may park again) so the thread can join
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    caller.join();
+    REQUIRE(began);
+    REQUIRE(finished);
+    if (error) std::rethrow_exception(error);
+}
+
 // Threw only for the driver-specific DriverException (0x500) the #575 contract
 // requires; any other code is ThrewOther, so a changed code fails the tests.
 enum class SlewingRead : std::uint8_t { True, False, Threw, ThrewOther };
@@ -256,6 +288,51 @@ SlewingRead read_slewing(alpacacore::TelescopeDriver& driver, std::string* messa
 }
 
 }  // namespace
+
+TEST_CASE("Celestron Telescope Driver - all four equatorial slews are refused while Tracking is false",
+          "[celestron][telescope][async][tracking-guard]") {
+    auto st = std::make_shared<FakeCelestronState>();
+    st->tracking_on.store(false);
+    alpacacore::test::FakeMountServer server(celestron_responder(st));
+    REQUIRE(server.ok());
+    auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    REQUIRE_FALSE(driver->get_tracking());
+    const double ra = no_flip_ra_hours();
+
+    const auto require_code = [](const std::function<void()>& call, int code) {
+        try {
+            call();
+            FAIL("Expected an AlpacaException");
+        } catch (const alpacacore::AlpacaException& ex) {
+            CHECK(ex.error_code() == code);
+        }
+    };
+    // Argument validation comes first: a bad Dec is InvalidValue even with Tracking off.
+    require_code([&] { driver->slew_to_coordinates(ra, 95.0); }, alpacacore::AlpacaError::InvalidValue);
+    require_code([&] { driver->slew_to_coordinates_async(ra, 95.0); }, alpacacore::AlpacaError::InvalidValue);
+
+    require_code([&] { driver->slew_to_coordinates(ra, 20.0); }, alpacacore::AlpacaError::InvalidOperation);
+    require_code([&] { driver->slew_to_coordinates_async(ra, 20.0); }, alpacacore::AlpacaError::InvalidOperation);
+    driver->set_target_right_ascension(ra);
+    driver->set_target_declination(20.0);
+    require_code([&] { driver->slew_to_target(); }, alpacacore::AlpacaError::InvalidOperation);
+    require_code([&] { driver->slew_to_target_async(); }, alpacacore::AlpacaError::InvalidOperation);
+
+    // Nothing reached the mount, and the driver is not slewing.
+    CHECK_FALSE(wait_until([&] { return st->goto_count.load() != 0; }, 300));
+    CHECK(st->cancel_goto_count.load() == 0);
+    CHECK_FALSE(driver->get_slewing());
+
+    // With Tracking on (re-read on the next connect) the same call goes through.
+    driver->set_connected(false);
+    st->tracking_on.store(true);
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
+    REQUIRE(driver->get_tracking());
+    REQUIRE_NOTHROW(driver->slew_to_coordinates_async(ra, 20.0));
+    CHECK(wait_until([&] { return st->goto_count.load() != 0; }, 3000));
+    driver->set_connected(false);
+}
 
 TEST_CASE("Celestron async - a GOTO the hand controller never acknowledges surfaces through Slewing (#575)",
           "[celestron][telescope][async][slewfailure]") {
@@ -1155,10 +1232,12 @@ TEST_CASE("Celestron PulseGuide - an operation that reaps the pulse clears IsPul
           "[celestron][telescope][pulseguiding][reap]") {
     enum class Op { SlewToCoordinates, SlewToCoordinatesAsync, FindHome, Park };
     for (const Op op : {Op::SlewToCoordinates, Op::SlewToCoordinatesAsync, Op::FindHome, Op::Park}) {
+        alpacacore::test::FakeTaskClock clock;
         auto st = std::make_shared<FakeCelestronState>();
+        st->clock = &clock;
         alpacacore::test::FakeMountServer server(celestron_responder(st));
         REQUIRE(server.ok());
-        auto driver = alpacacore::vendor::celestron::create_celestron_telescope(0, endpoint(server.port()));
+        auto driver = make_driver(server.port(), clock);
         REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(10)));
         REQUIRE(driver->get_can_pulse_guide());
 
@@ -1166,7 +1245,9 @@ TEST_CASE("Celestron PulseGuide - an operation that reaps the pulse clears IsPul
         REQUIRE(driver->get_is_pulse_guiding());
         switch (op) {
             case Op::SlewToCoordinates:
-                driver->slew_to_coordinates(no_flip_ra_hours(), 20.0);
+                run_virtual(
+                    clock, [&] { driver->slew_to_coordinates(no_flip_ra_hours(), 20.0); },
+                    [&] { return st->goto_count.load() >= 1; });  // the pulse is reaped, the GOTO is out
                 break;
             case Op::SlewToCoordinatesAsync:
                 driver->slew_to_coordinates_async(no_flip_ra_hours(), 20.0);
@@ -1180,6 +1261,8 @@ TEST_CASE("Celestron PulseGuide - an operation that reaps the pulse clears IsPul
         }
         INFO("op " << static_cast<int>(op));
         CHECK_FALSE(driver->get_is_pulse_guiding());
+        // The async slew, FindHome and park run on the task clock: step them out before the disconnect joins them.
+        REQUIRE(advance_until(clock, [&] { return !driver->get_slewing(); }));
         driver->set_connected(false);
     }
 }

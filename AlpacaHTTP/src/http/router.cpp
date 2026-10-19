@@ -16,6 +16,7 @@
 #include <alpacacore/device_registry.h>
 #include <alpacacore/filterwheel_driver.h>
 #include <alpacacore/telescope_driver.h>
+#include <alpacacore/util/alignment_mode.h>
 #include <alpacacore/util/error_handling.h>
 #include <alpacacore/util/hardware_config_refusal.h>
 #include <alpacacore/util/image_validation.h>
@@ -62,16 +63,6 @@
 #include <vector>
 
 #include "../core/catalog_json.h"
-#ifdef ALPACACORE_ENABLE_IOPTRON
-#include <alpacacore/vendor/ioptron/ioptron_filterwheel_driver.h>
-#include <alpacacore/vendor/ioptron/ioptron_ieaf_focuser_driver.h>
-#include <alpacacore/vendor/ioptron/ioptron_switch_driver.h>
-#include <alpacacore/vendor/ioptron/ioptron_telescope_driver.h>
-#endif
-#ifdef ALPACACORE_ENABLE_PLAYERONE
-// The ioptron/camera (iCAM) arm only; the playerone pairs are catalog descriptors.
-#include <alpacacore/vendor/playerone/playerone_camera_driver.h>
-#endif
 
 namespace {
 
@@ -1137,7 +1128,7 @@ bool is_expected_validation_error(const alpacacore::AlpacaException& e) {
 
 void log_alpaca_exception(const std::string& context, const alpacacore::AlpacaException& e) {
     std::string message = context + ": " + alpacahttp::util::escape_for_log(e.what(), 4096);
-    if (is_expected_not_implemented(e) || is_expected_validation_error(e)) {
+    if (is_expected_not_implemented(e) || is_expected_validation_error(e) || e.is_asked_too_early()) {
         alpacahttp::util::log_debug(message);
     } else {
         alpacahttp::util::log_error(message);
@@ -1856,6 +1847,11 @@ RouteMatch Router::parse_route(const std::string& path) {
         match.management_endpoint = "devicecatalog";
         return match;
     }
+    if (path == "/management/v1/thermalcameras" || path == "/management/thermalcameras") {
+        match.is_management = true;
+        match.management_endpoint = "thermalcameras";
+        return match;
+    }
     if (path == "/management/v1/configuredevice" || path == "/management/configuredevice") {
         match.is_management = true;
         match.management_endpoint = "configuredevice";
@@ -1920,7 +1916,7 @@ RouteMatch Router::parse_route(const std::string& path) {
         }
     }
     {
-        // Software update: /management/v1/update/<status|check|install>.
+        // Software update: /management/v1/update/<status|check|install|channel>.
         static const std::regex kUpdateRegex(R"(^/management/(?:v1/)?update/([a-z]+)/?$)");
         std::smatch update_match;
         if (std::regex_match(path, update_match, kUpdateRegex)) {
@@ -1981,6 +1977,8 @@ Response Router::handle_management(const Request& request, const RouteMatch& mat
         return handle_failed_devices(request, server_tx_id);
     } else if (match.management_endpoint == "devicecatalog") {
         return handle_device_catalog(request, server_tx_id);
+    } else if (match.management_endpoint == "thermalcameras") {
+        return handle_thermal_cameras(request, server_tx_id);
     } else if (match.management_endpoint == "configuredevice") {
         return handle_configure_device(request, server_tx_id);
     } else if (match.management_endpoint == "removedevice") {
@@ -6649,6 +6647,58 @@ Response Router::handle_device_catalog(const Request& request, std::uint32_t ser
     return response;
 }
 
+// The cameras a vendor's camera-attached thermal switch can bind to, for the web
+// UI's camera picker: GET /management/v1/thermalcameras?vendor=zwo. The lister
+// (registered in the catalog when the vendor is built) may open cameras through
+// the vendor's ref-counted wrapper to read their controls and serial.
+Response Router::handle_thermal_cameras(const Request& request, std::uint32_t server_tx_id) {
+    Response response;
+    response.set_content_type("application/json");
+
+    std::uint32_t client_tx_id = 0;
+    if (request.has_query_param("ClientTransactionID")) {
+        client_tx_id = parse_client_transaction_id(request.get_query_param("ClientTransactionID"));
+    }
+
+    if (request.method() != HttpMethod::GET) {
+        AlpacaResponse alpaca_response =
+            make_error_response(client_tx_id, server_tx_id, util::ErrorCode::INVALID_OPERATION,
+                                "Unsupported HTTP method for thermalcameras endpoint");
+        response.set_body(alpaca_response);
+        response.set_status(405, "Method Not Allowed");
+        return response;
+    }
+
+    const std::string vendor = request.get_query_param("vendor");
+    try {
+        const auto cameras = catalog_.list_thermal_cameras(vendor);
+        if (!cameras.has_value()) {
+            AlpacaResponse alpaca_response = make_error_response(
+                client_tx_id, server_tx_id, util::ErrorCode::INVALID_VALUE,
+                "No thermal switch camera listing for vendor '" + util::escape_for_log(vendor) + "' in this build");
+            response.set_body(alpaca_response);
+            return response;
+        }
+        nlohmann::json list = nlohmann::json::array();
+        for (const auto& camera : *cameras) {
+            list.push_back({{"Index", camera.index},
+                            {"Name", camera.name},
+                            {"Serial", camera.serial},
+                            {"HasThermal", camera.has_thermal}});
+        }
+        AlpacaResponse alpaca_response(client_tx_id, server_tx_id);
+        alpaca_response.value = std::move(list);
+        response.set_body(alpaca_response);
+    } catch (const std::exception& e) {
+        util::log_error("Error listing thermal switch cameras: " + std::string(e.what()));
+        AlpacaResponse alpaca_response = make_error_response(
+            client_tx_id, server_tx_id, util::exception_to_error_code(e), util::exception_to_error_message(e));
+        response.set_body(alpaca_response);
+    }
+
+    return response;
+}
+
 Response Router::handle_static_file(const Request& request) {
     Response response;
     std::string file_path = request.path();
@@ -6866,7 +6916,7 @@ std::optional<std::string> known_alignment_mode(const nlohmann::json& config) {
         return std::nullopt;
     }
     std::string mode = config.at("alignmentMode").get<std::string>();
-    if (mode == "auto" || mode == "altaz" || mode == "equatorial") {
+    if (alpacacore::util::is_known_alignment_mode(mode)) {
         return mode;
     }
     return std::nullopt;
@@ -6944,75 +6994,6 @@ std::vector<std::string> drop_unreadable_selectors(nlohmann::json& config,
         dropped.emplace_back(f.key);
     }
     return dropped;
-}
-
-// Reads siteLatitude/siteLongitude out of a device config and range-checks
-// them (issue #398).
-//
-// Both fields used to be checked for PRESENCE (#274/#353) and never for
-// plausibility, and neither did any driver constructor. So a config carrying
-// `{"siteLatitude": 200, "siteLongitude": 999}` registered, connected and was
-// used: Sky-Watcher's `hemisphere_south_locked()` reads latitude 200 as
-// northern, and every LST computation took longitude 999 at face value. The
-// mount pointed somewhere meaningless and nothing said why. The same drivers
-// already reject exactly these values through the ASCOM setters, which throw
-// InvalidValue outside +/-90 and +/-180, so a client could not do this at
-// runtime -- only a config could.
-//
-// `from_api` carries #353's asymmetry, for the reason spelled out on
-// Router::ConfigSource: a config arriving over /management/v1/configuredevice
-// can still be corrected by its caller, so it is rejected; one already on
-// disk is registered anyway (dropping it would remove the device from
-// configureddevices, which is the web UI's only source of devices, leaving
-// no way to edit the entry at fault) with the offending coordinate cleared
-// and a WARN naming it. Clearing it is what makes the two paths agree: an
-// out-of-range coordinate is exactly as unusable as an absent one, so the
-// driver's own unset handling -- refusing the connect, for Sky-Watcher --
-// applies to both.
-bool read_site_coordinates(const nlohmann::json& config, bool from_api, const std::string& vendor, int device_number,
-                           std::optional<double>& site_latitude, std::optional<double>& site_longitude,
-                           std::string& error_message) {
-    struct Field {
-        const char* key;
-        double limit;
-        std::optional<double>* out;
-    };
-    const Field fields[] = {
-        {"siteLatitude", 90.0, &site_latitude},
-        {"siteLongitude", 180.0, &site_longitude},
-    };
-
-    for (const Field& field : fields) {
-        if (!config_has(config, field.key)) {
-            continue;
-        }
-        const double value = config_get(config, field.key, 0.0);
-        // Rejects NaN and the infinities too: both comparisons are false for
-        // NaN, so the !(in range) form below catches it where (out of range)
-        // would not.
-        if (!(value >= -field.limit && value <= field.limit)) {
-            using alpacacore::catalog::format_bound;
-            const auto kDouble = alpacacore::catalog::FieldRef::Kind::Double;
-            const std::string detail = std::string(field.key) + " " + format_bound(kDouble, value) +
-                                       " is out of range: must be between " + format_bound(kDouble, -field.limit) +
-                                       " and " + format_bound(kDouble, field.limit) + " degrees";
-            if (from_api) {
-                error_message = detail;
-                return false;
-            }
-            std::string warning = "Persisted ";
-            warning += vendor;
-            warning += " device ";
-            warning += std::to_string(device_number);
-            warning += ": ";
-            warning += detail;
-            warning += ". The coordinate is ignored; set a valid one in the web UI.";
-            util::log_warning(warning);
-            continue;
-        }
-        *field.out = value;
-    }
-    return true;
 }
 
 }  // namespace
@@ -8103,8 +8084,10 @@ Response Router::handle_software_update(const Request& request, const RouteMatch
     // threat model, see handle_sync_time). What a caller can make happen is
     // bounded outside this process: the helper unit installs one fixed
     // package from the host's own signed apt sources, and the polkit rule
-    // lets the service user start that one unit and nothing else. The
-    // check is read-only.
+    // lets the service user start three units and nothing else: the update
+    // unit and the two channel instances. The channel route takes no request
+    // text into a unit name (a two-entry table picks it). The check is
+    // read-only.
     Response response;
     response.set_content_type("application/json");
 
@@ -8141,6 +8124,22 @@ Response Router::handle_software_update(const Request& request, const RouteMatch
             ok.value = software_update_->check();
         } else if (sub == "install" && is_put) {
             ok.value = software_update_->install();
+        } else if (sub == "channel" && is_put) {
+            // Body {"Channel":"stable"|"beta"}; anything else is refused
+            // before the manager is reached. The unit started is picked from
+            // the manager's two-entry table, never built from this text, and
+            // the text is not echoed.
+            const auto body = nlohmann::json::parse(request.body(), nullptr, false);
+            std::optional<util::UpdateChannel> channel;
+            if (body.is_object() && body.contains("Channel") && body["Channel"].is_string()) {
+                channel = util::parse_channel(body["Channel"].get<std::string>());
+            }
+            if (!channel) {
+                auto bad = fail(util::ErrorCode::INVALID_VALUE, "Channel must be \"stable\" or \"beta\"");
+                bad.set_status(400, "Bad Request");
+                return bad;
+            }
+            ok.value = software_update_->set_channel(*channel);
         } else {
             return fail(util::ErrorCode::INVALID_VALUE, "Unknown update endpoint or method: " + sub);
         }
@@ -8217,27 +8216,6 @@ std::string persisted_device_subject(const std::string& vendor, const std::strin
     return "Persisted " + vendor + " " + device_type + " " + std::to_string(device_number);
 }
 
-// open-astro#765: a device config may not choose which GPIO chip, GPIO line or
-// device node the server opens. The boards have fixed wiring, so the only
-// accepted values are the board's own; anything else is refused before the
-// device is built or saved (configuredevice answers 400 for this prefix).
-bool refuse_hardware_config(std::string& error_message, const std::string& field, const std::string& allowed) {
-    error_message = alpacacore::util::hardware_config_refusal(field, allowed);
-    return false;
-}
-
-bool gpio_chip_is_board_chip(const std::string& value, const char* board_chip, std::string& error_message,
-                             const char* alt_chip = nullptr) {
-    if (value == board_chip || (alt_chip != nullptr && value == alt_chip)) {
-        return true;
-    }
-    std::string allowed = std::string("'") + board_chip + "'";
-    if (alt_chip != nullptr) {
-        allowed += std::string(" or '") + alt_chip + "'";
-    }
-    return refuse_hardware_config(error_message, "gpioChip", allowed);
-}
-
 // open-astro#664: the catalog consult in register_device_from_config() below.
 // DeviceCatalog::find_schema is private, so the router can only ask
 // describe() for the DescriptorView of a key.
@@ -8272,38 +8250,6 @@ nlohmann::json with_folded_connection_type(const nlohmann::json& config) {
 }
 }  // namespace
 
-bool Router::reject_invalid_config(ConfigSource source, const char* reason, const std::string& vendor,
-                                   const std::string& device_type, int device_number, std::string& error_message) {
-    if (source == ConfigSource::Api) {
-        error_message = reason;
-        return true;
-    }
-    util::log_warning(persisted_device_subject(vendor, device_type, device_number) + " will refuse to connect: " +
-                      reason + ". Registered anyway so it stays listed and editable in the web UI.");
-    return false;
-}
-
-std::string Router::normalize_persisted_connection_type(ConfigSource source, const std::string& conn_type,
-                                                        std::initializer_list<const char*> valid,
-                                                        const std::string& vendor, const std::string& device_type,
-                                                        int device_number) {
-    // The API's own else still rejects an unrecognised value, with the same
-    // message it always did.
-    if (source == ConfigSource::Api) {
-        return conn_type;
-    }
-    for (const char* candidate : valid) {
-        if (conn_type == candidate) {
-            return conn_type;
-        }
-    }
-    util::log_warning(persisted_device_subject(vendor, device_type, device_number) + " has connectionType \"" +
-                      conn_type +
-                      "\", which is not one this driver knows; treating it as \"serial\" so the device stays listed "
-                      "and editable in the web UI. Fix it there; the connect will fail until you do.");
-    return "serial";
-}
-
 bool Router::register_device_from_config(const nlohmann::json& raw_config, std::string& error_message,
                                          ConfigSource source, nlohmann::json* learned_config) {
     const nlohmann::json config = with_folded_connection_type(raw_config);
@@ -8318,9 +8264,9 @@ bool Router::register_device_from_config(const nlohmann::json& raw_config, std::
 
     auto& registry = alpacacore::management::DeviceRegistry::instance();
 
-    // open-astro#664: the catalog is consulted before the arm chain below. A
+    // open-astro#664: the catalog is consulted before the not-supported answer below. A
     // device_type_str the catalog doesn't recognise (string_to_device_type()
-    // throws) just skips the consult -- the arm chain's final "not yet
+    // throws) just skips the consult -- the final "not yet
     // supported" message still answers, unchanged. Only that lookup is
     // guarded: an AlpacaException out of config_from_json below must
     // propagate like a config_get() failure does today, not be swallowed here.
@@ -8328,10 +8274,10 @@ bool Router::register_device_from_config(const nlohmann::json& raw_config, std::
     try {
         device_type_key = string_to_device_type(device_type_str);
     } catch (const std::exception& ex) {
-        // Unknown device_type_str: fall through to the arm chain.
+        // Unknown device_type_str: answer not supported.
         util::log_debug("register_device_from_config: device type \"" + util::escape_for_log(device_type_str) +
                         "\" is not catalog-recognized (" + util::escape_for_log(ex.what()) +
-                        "); falling through to the arm chain");
+                        "); the device is answered as not supported");
     }
     if (device_type_key) {
         const alpacacore::catalog::DeviceKey key{vendor, *device_type_key};
@@ -8356,9 +8302,7 @@ bool Router::register_device_from_config(const nlohmann::json& raw_config, std::
                     return false;
                 }
             } else {
-                // ALP-271: distinct from reject_invalid_config()'s "will refuse to
-                // connect" wording below, which is false here -- normalize() has
-                // already substituted a usable value (the field's default, or
+                // ALP-271: normalize() has already substituted a usable value (the field's default, or
                 // unset), so the device is not refusing to connect over this.
                 for (const auto& warning : result.warnings) {
                     util::log_warning(persisted_device_subject(vendor, device_type_str, device_number) +
@@ -8366,6 +8310,24 @@ bool Router::register_device_from_config(const nlohmann::json& raw_config, std::
                                       ". The saved value is not used: the field falls back to its default, or "
                                       "stays unset if it has none. Registered so it stays listed and editable in "
                                       "the web UI.");
+                }
+                if (learned_config != nullptr) {
+                    // #508 item 5: a saved site coordinate that the descriptor declares and
+                    // normalize() dropped as out of range is forgotten in the stored entry
+                    // too, so the entry holds what the driver uses and the next save does not
+                    // write it back. A coordinate the descriptor does not declare is never in
+                    // `normalized`, so it is left alone.
+                    const auto normalized = catalog_json::json_from_config(result.config);
+                    for (const char* key : {"siteLatitude", "siteLongitude"}) {
+                        const auto original = config.find(key);
+                        const bool declared =
+                            std::any_of(view->fields.begin(), view->fields.end(),
+                                        [key](const auto& field) { return std::string_view{field.key} == key; });
+                        if (declared && original != config.end() && original->is_number() &&
+                            normalized.find(key) == normalized.end()) {
+                            (*learned_config)[key] = nullptr;
+                        }
+                    }
                 }
                 if (view->forget_dropped_selectors && learned_config != nullptr) {
                     const auto normalized = catalog_json::json_from_config(result.config);
@@ -8455,272 +8417,6 @@ bool Router::register_device_from_config(const nlohmann::json& raw_config, std::
         }
     }
 
-    if (vendor == "ioptron" && device_type_str == "telescope") {
-#ifdef ALPACACORE_ENABLE_IOPTRON
-        std::string conn_type = config_get(config, "connectionType", "auto");
-        // Issue #380: an unrecognised connectionType on a persisted config is
-        // normalised to "serial" rather than dropping the device, so it stays
-        // listed and editable in the web UI and its connect fails on the port
-        // path instead of auto-probing and attaching to whatever answers. The
-        // else below still rejects the value when it came from the API.
-        conn_type = normalize_persisted_connection_type(source, conn_type, {"", "auto", "serial", "network"}, vendor,
-                                                        device_type_str, device_number);
-
-        std::optional<double> site_latitude;
-        std::optional<double> site_longitude;
-        std::optional<double> site_elevation;
-        std::optional<bool> sync_time_on_connect;
-
-        if (!read_site_coordinates(config, source == ConfigSource::Api, vendor, device_number, site_latitude,
-                                   site_longitude, error_message)) {
-            return false;
-        }
-        if (config_has(config, "siteElevation")) {
-            site_elevation = config_get(config, "siteElevation", 0.0);
-        }
-        if (config_has(config, "syncTimeOnConnect")) {
-            sync_time_on_connect = config_get(config, "syncTimeOnConnect", false);
-        }
-
-        std::unique_ptr<alpacacore::TelescopeDriver> telescope;
-
-        if (conn_type == "auto" || conn_type.empty()) {
-            int mount_index = config_get(config, "mountIndex", 0);
-            telescope = alpacacore::vendor::ioptron::create_ioptron_telescope_auto(
-                device_number, mount_index, site_latitude, site_longitude,
-                site_elevation, sync_time_on_connect);
-        } else {
-            alpacacore::vendor::ioptron::ConnectionInfo conn_info;
-
-            if (conn_type == "serial") {
-                conn_info.type = alpacacore::vendor::ioptron::ConnectionType::Serial;
-                conn_info.port_path = config_get(config, "portPath", "");
-                conn_info.baud_rate = config_get(config, "baudRate", 115200);
-
-                if (conn_info.port_path.empty() &&
-                    reject_invalid_config(source, "Serial port path is required", vendor, device_type_str,
-                                          device_number, error_message)) {
-                    return false;
-                }
-            } else if (conn_type == "network") {
-                conn_info.type = alpacacore::vendor::ioptron::ConnectionType::Network;
-                conn_info.host = config_get(config, "host", "");
-                conn_info.tcp_port = config_get(config, "tcpPort", 4030);
-
-                if (conn_info.host.empty()) {
-                    int mount_index = config_get(config, "mountIndex", 0);
-                    telescope = alpacacore::vendor::ioptron::create_ioptron_telescope_auto_network(
-                        device_number, mount_index, site_latitude, site_longitude,
-                        site_elevation, sync_time_on_connect);
-                }
-            } else {
-                error_message = "Invalid connection type. Use 'auto', 'serial', or 'network'";
-                return false;
-            }
-
-            if (!telescope) {
-                conn_info.response_timeout_ms = config_get(config, "responseTimeoutMs", conn_info.response_timeout_ms);
-
-                telescope = alpacacore::vendor::ioptron::create_ioptron_telescope_with_site(
-                    device_number, conn_info, site_latitude, site_longitude,
-                    site_elevation, sync_time_on_connect);
-            }
-        }
-
-        if (double aperture = config_get(config, "apertureDiameter", 0.0); aperture > 0.0) {
-            telescope->set_aperture_diameter(aperture);
-        }
-        if (double focal = config_get(config, "focalLength", 0.0); focal > 0.0) {
-            telescope->set_focal_length(focal);
-        }
-        if (site_elevation.has_value()) {
-            telescope->set_site_elevation(site_elevation.value());
-        }
-
-        if (registry.register_device(std::shared_ptr<alpacacore::AlpacaDriver>(std::move(telescope)))) {
-            util::log_info("Registered iOptron telescope");
-            return true;
-        }
-
-        error_message = "Failed to register device. Device may already exist.";
-        return false;
-#else
-        error_message = "iOptron support not enabled. Rebuild with -DALPACACORE_ENABLE_IOPTRON=ON";
-        return false;
-#endif
-    }
-
-    if (vendor == "ioptron" && device_type_str == "switch") {
-#if defined(ALPACACORE_ENABLE_IOPTRON) && defined(ALPACACORE_IOPTRON_POWERBOX)
-        // iMate PowerBox: on-board DC power ports driven over local GPIO
-        // (libgpiod) — independent of the mount RS-232 protocol. Switch 0 is
-        // the always-on DC pass-through (read-only); switches 1/2 are the
-        // controllable DC1/DC2 lines.
-        auto powerbox_config = alpacacore::vendor::ioptron::default_imate_powerbox_config();
-        powerbox_config.gpio_chip_path = config_get(config, "gpioChip", powerbox_config.gpio_chip_path);
-        if (!gpio_chip_is_board_chip(powerbox_config.gpio_chip_path, "/dev/gpiochip1", error_message,
-                                     "/dev/gpiochip0" /* stock BSP kernel */)) {
-            return false;
-        }
-        powerbox_config.pwm_frequency_hz = config_get(config, "pwmFrequencyHz", powerbox_config.pwm_frequency_hz);
-        // Per-port PWM/name overrides applied positionally onto the fixed
-        // DC3/DC1/DC2 layout. The always-on pass-through has no GPIO line and
-        // can't be PWM, so its pwm flag is ignored.
-        if (config_has(config, "ports") && config["ports"].is_array()) {
-            const auto& port_overrides = config["ports"];
-            auto& ports = powerbox_config.ports;
-            for (std::size_t i = 0; i < ports.size() && i < port_overrides.size(); ++i) {
-                const auto& p = port_overrides[i];
-                // Skip non-object entries (e.g. "ports":[null]) — contains()/value()
-                // throw nlohmann type_error on a non-object, which would 500 the request.
-                if (!p.is_object()) {
-                    continue;
-                }
-                if (p.contains("name")) {
-                    ports[i].name = p.value("name", ports[i].name);
-                }
-                if (ports[i].has_line) {
-                    ports[i].pwm_enabled = p.value("pwm", ports[i].pwm_enabled);
-                }
-            }
-        }
-
-        auto sw = alpacacore::vendor::ioptron::create_ioptron_switch(device_number, std::move(powerbox_config));
-
-        if (registry.register_device(std::shared_ptr<alpacacore::AlpacaDriver>(std::move(sw)))) {
-            util::log_info("Registered iOptron iMate PowerBox switch");
-            return true;
-        }
-
-        error_message = "Failed to register device. Device may already exist.";
-        return false;
-#elif defined(ALPACACORE_ENABLE_IOPTRON)
-        error_message =
-            "iOptron iMate PowerBox switch not built. Rebuild on a host with "
-            "libgpiod (>= 2.0) installed (e.g. apt install libgpiod-dev).";
-        return false;
-#else
-        error_message = "iOptron support not enabled. Rebuild with -DALPACACORE_ENABLE_IOPTRON=ON";
-        return false;
-#endif
-    }
-
-    if (vendor == "ioptron" && device_type_str == "focuser") {
-#ifdef ALPACACORE_ENABLE_IOPTRON
-        // iEAF / iAFS2/3 electronic focuser — USB-serial only, fixed 115200 baud.
-        std::string conn_type = config_get(config, "connectionType", "auto");
-        // "ieaf" (default) or "iafs2": identical protocol, sets the reported
-        // device name.
-        std::string model = config_get(config, "model", "ieaf");
-
-        std::unique_ptr<alpacacore::FocuserDriver> focuser;
-        if (conn_type == "serial") {
-            std::string port_path = config_get(config, "portPath", "");
-            if (port_path.empty()) {
-                // No port specified with serial mode — fall through to auto-detect
-                int focuser_index = config_get(config, "focuserIndex", 0);
-                focuser =
-                    alpacacore::vendor::ioptron::create_ieaf_focuser_by_index(device_number, focuser_index, model);
-            } else {
-                focuser = alpacacore::vendor::ioptron::create_ieaf_focuser(device_number, port_path, model);
-            }
-        } else {
-            // "auto" or unset — auto-detect
-            int focuser_index = config_get(config, "focuserIndex", 0);
-            focuser = alpacacore::vendor::ioptron::create_ieaf_focuser_by_index(device_number, focuser_index, model);
-        }
-
-        if (registry.register_device(std::shared_ptr<alpacacore::AlpacaDriver>(std::move(focuser)))) {
-            util::log_info("Registered iOptron iEAF focuser");
-            return true;
-        }
-
-        error_message = "Failed to register device. Device may already exist.";
-        return false;
-#else
-        error_message = "iOptron support not enabled. Rebuild with -DALPACACORE_ENABLE_IOPTRON=ON";
-        return false;
-#endif
-    }
-
-    if (vendor == "ioptron" && device_type_str == "camera") {
-        // iOptron iCAM cameras (e.g. iCAM178M) are rebadged Player One
-        // cameras: USB VID a0a0, and the Player One SDK enumerates them by
-        // name ("iCAM178M"). Reuse the Player One camera driver directly;
-        // there is no iOptron camera SDK. Requires the Player One build flag.
-#ifdef ALPACACORE_ENABLE_PLAYERONE
-        int camera_index = config_get(config, "cameraIndex", 0);
-
-        auto camera = alpacacore::vendor::playerone::create_playerone_camera(device_number, camera_index);
-
-        if (registry.register_device(std::shared_ptr<alpacacore::AlpacaDriver>(std::move(camera)))) {
-            util::log_info("Registered iOptron iCAM camera (Player One SDK)");
-            return true;
-        }
-
-        error_message = "Failed to register device. Device may already exist.";
-        return false;
-#else
-        error_message = "iOptron iCAM cameras use the Player One SDK. Rebuild with -DALPACACORE_ENABLE_PLAYERONE=ON";
-        return false;
-#endif
-    }
-
-    if (vendor == "ioptron" && device_type_str == "filterwheel") {
-#ifdef ALPACACORE_ENABLE_IOPTRON
-        // iEFW-15 / iEFW-18 filter wheel — USB-serial only, fixed 115200 baud.
-        // Slot count comes from the wheel's handshake, not from config.
-        std::string conn_type = config_get(config, "connectionType", "auto");
-        // "iefw15" (default) or "iefw18": sets the reported device name; the
-        // slot count is always read from the wheel.
-        std::string model = config_get(config, "model", "iefw15");
-
-        std::unique_ptr<alpacacore::FilterWheelDriver> wheel;
-        if (conn_type == "serial") {
-            std::string port_path = config_get(config, "portPath", "");
-            if (port_path.empty()) {
-                error_message = "portPath is required when connectionType is 'serial' (or use 'auto').";
-                return false;
-            }
-            wheel = alpacacore::vendor::ioptron::create_iefw_filterwheel(device_number, port_path, model);
-        } else {
-            // "auto" or unset — auto-detect at connect
-            int wheel_index = config_get(config, "filterwheelIndex", 0);
-            if (wheel_index < 0) {
-                error_message = "filterwheelIndex must be >= 0.";
-                return false;
-            }
-            wheel = alpacacore::vendor::ioptron::create_iefw_filterwheel_by_index(device_number, wheel_index, model);
-        }
-
-        if (config_has(config, "filterNames")) {
-            const auto& names_value = config.at("filterNames");
-            if (!names_value.is_array()) {
-                error_message = "iOptron filter wheel filterNames must be an array";
-                return false;
-            }
-            for (const auto& name : names_value) {
-                if (!name.is_string()) {
-                    error_message = "iOptron filter wheel filterNames must be an array of strings";
-                    return false;
-                }
-            }
-            wheel->set_names(names_value.get<std::vector<std::string>>());
-        }
-
-        if (registry.register_device(std::shared_ptr<alpacacore::AlpacaDriver>(std::move(wheel)))) {
-            util::log_info("Registered iOptron iEFW filter wheel");
-            return true;
-        }
-
-        error_message = "Failed to register device. Device may already exist.";
-        return false;
-#else
-        error_message = "iOptron support not enabled. Rebuild with -DALPACACORE_ENABLE_IOPTRON=ON";
-        return false;
-#endif
-    }
-
     error_message = "Vendor/device type combination not yet supported: " + vendor + "/" + device_type_str;
     return false;
 }
@@ -8770,11 +8466,9 @@ nlohmann::json Router::sanitize_device_config(const nlohmann::json& raw_config) 
     std::string vendor = config_get(config, "vendor", "");
     std::string device_type = config_get(config, "deviceType", "");
 
-    // open-astro#664: a catalog-registered vendor/type is sanitized from its
-    // descriptor's own field list; the vendor-specific chain below is for
-    // arm-chain vendors only. Either way the vendor-agnostic keys at the end
-    // are kept, as they were through the deleted arm.
-    bool catalog_handled = false;
+    // open-astro#664: a vendor/type is sanitized from its catalog descriptor's own
+    // field list (every vendor is one now). The vendor-agnostic keys at the end are
+    // kept for any config, as they were through the deleted arms.
     try {
         const alpacacore::catalog::DeviceKey key{vendor, string_to_device_type(device_type)};
         if (auto view = find_descriptor(catalog_, key)) {
@@ -8782,62 +8476,12 @@ nlohmann::json Router::sanitize_device_config(const nlohmann::json& raw_config) 
             for (const auto& [k, v] : extra.items()) {
                 sanitized[k] = v;
             }
-            catalog_handled = true;
         }
     } catch (const std::exception& ex) {
-        // Unknown device_type: fall through to the vendor-specific chain.
+        // Unknown device_type: only the vendor-agnostic keys below are kept.
         util::log_debug("sanitize_device_config: device type \"" + util::escape_for_log(device_type) +
                         "\" is not catalog-recognized (" + util::escape_for_log(ex.what()) +
-                        "); falling through to the vendor-specific chain");
-    }
-
-    if (catalog_handled) {
-        // Vendor-specific keys came from the descriptor above.
-    } else if (vendor == "ioptron") {
-        if (device_type == "switch") {
-            // iMate PowerBox: local GPIO. Persist the optional chip path plus
-            // the PWM frequency and per-port PWM/name overrides so dimmable-port
-            // config survives a save (sanitize strips anything not allowlisted).
-            copy_if_present("gpioChip");
-            copy_if_present("pwmFrequencyHz");
-            copy_if_present("ports");
-        } else if (device_type == "camera") {
-            // iCAM (Player One rebadge): SDK enumeration index only.
-            copy_if_present("cameraIndex");
-        } else if (device_type == "filterwheel") {
-            // iEFW: USB-serial only, fixed baud — no baudRate/network fields.
-            copy_if_present("connectionType");
-            copy_if_present("model");
-            copy_if_present("filterwheelIndex");
-            copy_if_present("filterNames");
-            std::string connection_type = config_get(config, "connectionType", "");
-            if (connection_type == "serial") {
-                copy_if_present("portPath");
-            }
-        } else if (device_type == "focuser") {
-            // iEAF / iAFS2/3: USB-serial only, fixed baud — no baudRate/network fields.
-            copy_if_present("connectionType");
-            copy_if_present("focuserIndex");
-            copy_if_present("model");
-            std::string connection_type = config_get(config, "connectionType", "");
-            if (connection_type == "serial") {
-                copy_if_present("portPath");
-            }
-        } else {
-            copy_if_present("connectionType");
-            // mountIndex is read by the auto-detect registration path; without
-            // it here the saved index silently reverted to 0 (issue #102 —
-            // Celestron was the only mount vendor allowlisting it).
-            copy_if_present("mountIndex");
-            std::string connection_type = config_get(config, "connectionType", "");
-            if (connection_type == "serial") {
-                copy_if_present("portPath");
-                copy_if_present("baudRate");
-            } else if (connection_type == "network") {
-                copy_if_present("host");
-                copy_if_present("tcpPort");
-            }
-        }
+                        "); only the vendor-agnostic keys are kept");
     }
 
     copy_if_present("responseTimeoutMs");
@@ -8857,7 +8501,7 @@ void Router::persist_client_site(const alpacacore::AlpacaDriver& device, const c
     // and parses, so the setter takes it for the session; nlohmann dumps a
     // non-finite double as null, which the next start reads as "absent" and
     // the driver then refuses to connect. The surveyed value stays on disk.
-    // read_site_coordinates() applies the same rule on the config path.
+    // The ioptron schema's normalize applies the same rule on the config path.
     if (!std::isfinite(value)) {
         return;
     }
@@ -9075,7 +8719,11 @@ void Router::load_persisted_devices() {
         try {
             nlohmann::json learned_config = nlohmann::json::object();
             if (!register_device_from_config(entry, error_message, ConfigSource::Persisted, &learned_config)) {
-                util::log_warning("Skipping persisted device: " + error_message);
+                // The message can quote the saved vendor / deviceType; the file is
+                // outside the server's control, so escape it (no cut: the whole
+                // message is the diagnosis).
+                util::log_warning("Skipping persisted device: " +
+                                  util::escape_for_log(error_message, error_message.size()));
             } else if (!learned_config.empty()) {
                 // #914: what the registration learned about the device (a ZWO
                 // camera's serial, model name, UniqueID) goes back into the

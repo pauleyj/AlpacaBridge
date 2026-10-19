@@ -23,12 +23,14 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "catch2_compat.h"
 #include "fake_touptek_sdk.h"
@@ -155,6 +157,85 @@ TEST_CASE("ToupTek thermal switch - failed connect releases the shared open", "[
     CHECK(fake.underflow_closes == 0);
 }
 
+namespace {
+
+// An uncooled camera first, a cooled one second: the order that bound a
+// switch saved at index 0 to the camera with no heater.
+FakeToupTekSDK make_fake_uncooled_then_cooled() {
+    FakeToupTekSDK fake;
+    auto uncooled = FakeToupTekSDK::default_camera("fake-guide", "G3M678M");
+    uncooled.supports_cooler = false;
+    uncooled.supports_heat = false;
+    uncooled.supports_fan = false;
+    uncooled.max_fan_speed = 0;
+    fake.cameras.push_back(uncooled);
+    fake.cameras.push_back(FakeToupTekSDK::default_camera("fake-main", "ATR585M"));
+    fake.taillight_supported = false;
+    return fake;
+}
+
+}  // namespace
+
+TEST_CASE("ToupTek thermal switch - Auto binds the one camera with a heater or fan",
+          "[touptek][switch][unit][fakesdk]") {
+    auto fake = make_fake_uncooled_then_cooled();
+    auto thermal =
+        alpacacore::vendor::touptek::create_touptek_thermal_switch(0, alpacacore::util::kAutoThermalCamera, fake);
+    thermal->set_connected(true);
+    CHECK(thermal->get_connected() == true);
+    CHECK(fake.last_opened_id == "fake-main");
+    CHECK(fake.ref_count("fake-guide") == 0);
+    thermal->set_connected(false);
+    CHECK(fake.underflow_closes == 0);
+}
+
+TEST_CASE("ToupTek thermal switch - a pinned camera with no heater or fan names the one that has them",
+          "[touptek][switch][unit][fakesdk]") {
+    auto fake = make_fake_uncooled_then_cooled();
+    auto thermal = alpacacore::vendor::touptek::create_touptek_thermal_switch(0, 0, fake);
+    try {
+        thermal->set_connected(true);
+        FAIL("Expected AlpacaException");
+    } catch (const AlpacaException& e) {
+        CHECK(e.error_code() == alpacacore::AlpacaError::NotImplemented);
+        const std::string message = e.what();
+        CHECK(message.find("Camera index 0 is the G3M678M") != std::string::npos);
+        CHECK(message.find("ATR585M (index 1)") != std::string::npos);
+    }
+    CHECK(thermal->get_connected() == false);
+    CHECK(fake.ref_count("fake-guide") == 0);
+    CHECK(fake.physical_opens == fake.physical_closes);
+}
+
+TEST_CASE("ToupTek thermal switch - Auto refuses two cooled cameras without opening either",
+          "[touptek][switch][unit][fakesdk]") {
+    auto fake = make_fake_uncooled_then_cooled();
+    fake.cameras.push_back(FakeToupTekSDK::default_camera("fake-second", "ATR2600M"));
+    auto thermal =
+        alpacacore::vendor::touptek::create_touptek_thermal_switch(0, alpacacore::util::kAutoThermalCamera, fake);
+    try {
+        thermal->set_connected(true);
+        FAIL("Expected AlpacaException");
+    } catch (const AlpacaException& e) {
+        CHECK(e.error_code() == alpacacore::AlpacaError::InvalidValue);
+        const std::string message = e.what();
+        CHECK(message.find("ATR585M (index 1), ATR2600M (index 2)") != std::string::npos);
+    }
+    CHECK(fake.physical_opens == 0);
+}
+
+TEST_CASE("ToupTek thermal camera listing - flags only, nothing opened", "[touptek][switch][unit][fakesdk]") {
+    auto fake = make_fake_uncooled_then_cooled();
+    const auto cameras = alpacacore::vendor::touptek::list_touptek_thermal_cameras(fake);
+    REQUIRE(cameras.size() == 2);
+    CHECK(cameras[0].index == 0);
+    CHECK(cameras[0].name == "G3M678M");
+    CHECK(cameras[0].has_thermal == false);
+    CHECK(cameras[1].index == 1);
+    CHECK(cameras[1].has_thermal == true);
+    CHECK(fake.physical_opens == 0);
+}
+
 TEST_CASE("ToupTek focuser - connect-path failure releases the shared open", "[touptek][focuser][unit][fakesdk]") {
     FakeToupTekSDK fake;
     FakeToupTekSDK::ToupFocuserInfo focuser;
@@ -220,7 +301,12 @@ TEST_CASE("ToupTek camera - thermal poller primes the cache at connect and is si
         }
         return pred();
     };
-    REQUIRE(wait_until([&] { return fake.call_count("get_temperature_deciC") >= 1; }, std::chrono::milliseconds(2000)));
+    // Wait on the tick's LAST read: it reads the temperature first and the TEC
+    // voltages after, so waiting on the temperature alone let the checks below
+    // run mid-tick, which the slow -O0 coverage build did (0 >= 1).
+    REQUIRE(
+        wait_until([&] { return fake.call_count("get_tec_voltage_max_deciV") >= 1; }, std::chrono::milliseconds(2000)));
+    CHECK(fake.call_count("get_temperature_deciC") >= 1);
     CHECK(fake.call_count("get_tec_voltage_deciV") >= 1);  // default fake camera supports the cooler
     CHECK(fake.call_count("get_tec_voltage_max_deciV") == 1);
 
@@ -303,6 +389,202 @@ TEST_CASE("ToupTek camera - malformed frame fails ImageReady and a later valid f
     CHECK(image.height == 2);
     CHECK(image.rank == 2);
     CHECK(image.data == std::vector<std::int32_t>{1, 2, 3, 4});
+    driver->set_connected(false);
+}
+
+namespace {
+
+// Little-endian 16-bit frame of `height` rows at `stride` pixels per row,
+// every pixel of row r holding value r + 1 (so a replicated row is visible).
+std::vector<std::uint8_t> frame_rows_numbered(int stride, int height) {
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(static_cast<std::size_t>(stride) * static_cast<std::size_t>(height) * 2);
+    for (int row = 0; row < height; ++row) {
+        for (int col = 0; col < stride; ++col) {
+            const auto value = static_cast<std::uint16_t>(row + 1);
+            bytes.push_back(static_cast<std::uint8_t>(value & 0xFF));
+            bytes.push_back(static_cast<std::uint8_t>(value >> 8));
+        }
+    }
+    return bytes;
+}
+
+bool image_ready_eventually(alpacacore::CameraDriver& driver) {
+    return eventually([&] {
+        try {
+            return driver.get_image_ready();
+        } catch (const AlpacaException&) {
+            return false;
+        }
+    });
+}
+
+}  // namespace
+
+// #977: the SDK rounds the binned OUTPUT down to even, so an odd NumX at bin 2
+// used to come back one column short and (since #963) fail the exposure. The
+// driver now asks for the next even output size and crops, so the client gets
+// num real columns.
+TEST_CASE("ToupTek camera - odd NumX at bin 2 reads real pixels from an even-grown ROI",
+          "[touptek][camera][unit][fakesdk]") {
+    auto fake = make_fake_with_camera();
+    auto driver = alpacacore::vendor::touptek::create_touptek_camera(0, 0, fake);
+    driver->set_connected(true);
+    driver->set_bin_x(2);
+    driver->set_bin_y(2);
+    driver->set_num_x(3);
+    driver->set_num_y(2);
+
+    fake.deliver_frame = true;
+    // The fake delivers floor_even(8 / 2) = 4 columns per row; the driver lays
+    // them out at a 4-pixel stride (a shorter pitch is E_INVALIDARG) and reads
+    // the first 3 of each row. 99 marks the cropped 4th column.
+    fake.frame_bytes = {1, 0, 2, 0, 3, 0, 99, 0, 4, 0, 5, 0, 6, 0, 99, 0};
+    driver->start_exposure(0.01, true);
+    REQUIRE(image_ready_eventually(*driver));
+
+    const auto roi = fake.last_roi();
+    CHECK(roi.width == 8U);   // (3 + 1) * 2, not 6
+    CHECK(roi.height == 4U);  // 2 * 2 is already even output
+    const auto image = driver->get_image_array();
+    CHECK(image.width == 3);
+    CHECK(image.height == 2);
+    CHECK(image.data == std::vector<std::int32_t>{1, 2, 3, 4, 5, 6});
+    CHECK(driver->get_num_x() == 3);
+    driver->set_connected(false);
+}
+
+// #977: a full frame whose binned height is odd (1066 / 3 = 355) cannot be
+// grown, the 356th binned row is off the sensor, so the SDK delivers 354 rows
+// and the driver fills the last requested row from its neighbour instead of
+// failing every full-frame exposure at bin 3 (the SC571CC's 4168 / 3 = 1389).
+TEST_CASE("ToupTek camera - odd full frame at bin 3 fills the missing sensor edge row from its neighbour",
+          "[touptek][camera][unit][fakesdk]") {
+    auto fake = make_fake_with_camera();
+    fake.cameras[0].max_height = 1066;
+    fake.cameras[0].supported_bins = {1, 2, 3, 4};
+    auto driver = alpacacore::vendor::touptek::create_touptek_camera(0, 0, fake);
+    driver->set_connected(true);
+    driver->set_bin_x(3);
+    driver->set_bin_y(3);
+    REQUIRE(driver->get_num_x() == 640);
+    REQUIRE(driver->get_num_y() == 355);
+
+    fake.deliver_frame = true;
+    fake.frame_bytes = frame_rows_numbered(640, 354);
+    driver->start_exposure(0.01, true);
+    REQUIRE(image_ready_eventually(*driver));
+
+    const auto roi = fake.last_roi();
+    CHECK(roi.height == 1066U);  // the whole even sensor; nothing more exists
+    const auto image = driver->get_image_array();
+    REQUIRE(image.width == 640);
+    REQUIRE(image.height == 355);
+    REQUIRE(image.data.size() == 640U * 355U);
+    CHECK(image.data[0] == 1);
+    CHECK(image.data[353U * 640U] == 354);  // last row the sensor delivered
+    CHECK(image.data[354U * 640U] == 354);  // filled from its neighbour
+    CHECK(image.data[354U * 640U + 639U] == 354);
+    driver->set_connected(false);
+}
+
+// #977 second half: at bin 1 an odd NumX is even-padded to a one-wider ROI, and
+// WaitImageV4 rejects a row pitch narrower than that frame (E_INVALIDARG), so
+// this sub-frame failed on every release. The driver now lays the frame out at
+// the delivered width and reads the first num_x columns.
+TEST_CASE("ToupTek camera - odd NumX at bin 1 lays the even-padded frame out at its own stride",
+          "[touptek][camera][unit][fakesdk]") {
+    auto fake = make_fake_with_camera();
+    auto driver = alpacacore::vendor::touptek::create_touptek_camera(0, 0, fake);
+    driver->set_connected(true);
+    driver->set_num_x(3);
+    driver->set_num_y(2);
+
+    fake.deliver_frame = true;
+    // The fake delivers the 4-pixel even-padded span; 99 marks the cropped column.
+    fake.frame_bytes = {1, 0, 2, 0, 3, 0, 99, 0, 4, 0, 5, 0, 6, 0, 99, 0};
+    driver->start_exposure(0.01, true);
+    REQUIRE(image_ready_eventually(*driver));
+
+    CHECK(fake.last_roi().width == 4U);
+    const auto image = driver->get_image_array();
+    CHECK(image.width == 3);
+    CHECK(image.height == 2);
+    CHECK(image.data == std::vector<std::int32_t>{1, 2, 3, 4, 5, 6});
+    driver->set_connected(false);
+}
+
+// #977: the column counterpart of the row fill. A full frame whose binned width
+// is odd (1066 / 3 = 355) cannot be grown, so the SDK delivers 354 columns and
+// the driver fills the last requested column from its neighbour.
+TEST_CASE("ToupTek camera - odd full frame at bin 3 fills the missing sensor edge column from its neighbour",
+          "[touptek][camera][unit][fakesdk]") {
+    auto fake = make_fake_with_camera();
+    fake.cameras[0].max_width = 1066;
+    fake.cameras[0].supported_bins = {1, 2, 3, 4};
+    auto driver = alpacacore::vendor::touptek::create_touptek_camera(0, 0, fake);
+    driver->set_connected(true);
+    driver->set_bin_x(3);
+    driver->set_bin_y(3);
+    REQUIRE(driver->get_num_x() == 355);
+    REQUIRE(driver->get_num_y() == 360);
+
+    fake.deliver_frame = true;
+    // 360 rows at the driver's 355-pixel stride, every pixel of column c = c + 1
+    // for the 354 delivered columns; column 354 is never written (stays 0).
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(355) * 360 * 2, 0);
+    for (int row = 0; row < 360; ++row) {
+        for (int col = 0; col < 354; ++col) {
+            const auto value = static_cast<std::uint16_t>(col + 1);
+            const std::size_t at = (static_cast<std::size_t>(row) * 355 + static_cast<std::size_t>(col)) * 2;
+            bytes[at] = static_cast<std::uint8_t>(value & 0xFF);
+            bytes[at + 1] = static_cast<std::uint8_t>(value >> 8);
+        }
+    }
+    fake.frame_bytes = bytes;
+    driver->start_exposure(0.01, true);
+    REQUIRE(image_ready_eventually(*driver));
+
+    CHECK(fake.last_roi().width == 1066U);
+    const auto image = driver->get_image_array();
+    REQUIRE(image.width == 355);
+    REQUIRE(image.height == 360);
+    CHECK(image.data[0] == 1);
+    CHECK(image.data[353] == 354);                 // last column the sensor delivered
+    CHECK(image.data[354] == 354);                 // filled from its neighbour
+    CHECK(image.data[359U * 355U + 354U] == 354);  // same on the last row
+    driver->set_connected(false);
+}
+
+// #913 still holds: a frame below what the ROI math predicts is malformed. Here
+// the fake answers 3 columns for a grown 8-pixel span at bin 2 (4 expected);
+// build_image_array alone would accept a one-column deficit, so this pins the
+// worker's check against the predicted size.
+TEST_CASE("ToupTek camera - a frame shorter than the binned ROI contract still fails",
+          "[touptek][camera][unit][fakesdk]") {
+    auto fake = make_fake_with_camera();
+    auto driver = alpacacore::vendor::touptek::create_touptek_camera(0, 0, fake);
+    driver->set_connected(true);
+    driver->set_bin_x(2);
+    driver->set_bin_y(2);
+    driver->set_num_x(3);
+    driver->set_num_y(2);
+
+    fake.deliver_frame = true;
+    fake.frame_bytes = {1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0};
+    fake.delivered_dimensions = std::pair<unsigned, unsigned>{3, 2};
+    driver->start_exposure(0.01, true);
+    REQUIRE(eventually([&] { return driver->get_camera_state() == alpacacore::CameraState::Idle; }));
+    auto error_code_of = [](const std::function<void()>& call) {
+        try {
+            call();
+            return 0;
+        } catch (const AlpacaException& e) {
+            return e.error_code();
+        }
+    };
+    CHECK(error_code_of([&] { (void)driver->get_image_ready(); }) == alpacacore::AlpacaError::DriverException);
+    CHECK(error_code_of([&] { (void)driver->get_image_array(); }) == alpacacore::AlpacaError::DriverException);
     driver->set_connected(false);
 }
 

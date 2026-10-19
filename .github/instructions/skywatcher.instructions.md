@@ -51,23 +51,23 @@ datagrams before each send so replies cannot get off-by-one.
   the registry, so `configureddevices` cannot list it and the web UI offers no way to edit
   the entry that is at fault. That asymmetry is the rule for any new validation in
   `register_device_from_config` — reject `ConfigSource::Api`, warn on `ConfigSource::Persisted`.
-  Since #380 that rule is not left to each branch to remember: `Router::reject_invalid_config()`
-  takes the source and the reason and returns whether the caller must refuse, and
-  `Router::normalize_persisted_connection_type()` does the same for an unrecognised
-  `connectionType`, which has no value to carry forward — it returns `"serial"` for a persisted
-  config, never `"auto"`, so the connect fails on the port path instead of auto-probing and
-  attaching to whatever mount answers. Use them rather than an inline `return false`; the
-  `portPath`, `host` and `connectionType` checks in every telescope branch do. Since #744 the
-  Sky-Watcher direct driver has no router branch: its device-catalog descriptor
-  (`AlpacaCore/src/vendors/skywatcher/skywatcher_schema.cpp`) applies the same source rule in
-  `Schema::normalize`, and the factory (`skywatcher_catalog.cpp`) logs the missing-site WARN.
+  Since #380 that rule was one helper pair in the router (`reject_invalid_config()`, which took
+  the source and the reason, and `normalize_persisted_connection_type()`, which turned an
+  unrecognised persisted `connectionType` into `"serial"`, never `"auto"`, so the connect fails on
+  the port path instead of auto-probing and attaching to whatever mount answers). Every vendor is
+  a device-catalog descriptor now and those helpers are gone: each descriptor's
+  `Schema::normalize` applies the same source rule (reject `Source::Api`, warn on
+  `Source::Persisted`), and the telescope schemas' `portPath`, `host` and `connectionType` checks
+  do. The Sky-Watcher direct driver's descriptor
+  (`AlpacaCore/src/vendors/skywatcher/skywatcher_schema.cpp`) is one; its factory
+  (`skywatcher_catalog.cpp`) logs the missing-site WARN.
   Both coordinates are also **range-checked** (#398), inclusive of ±90/±180 since the poles and
   the antimeridian are real places, and rejecting NaN and the infinities: presence alone let a
   config carry latitude 200, which reads as northern to `hemisphere_south_locked()`, while the
   ASCOM setters have always refused exactly that at runtime — a validation a client cannot bypass
-  but a config can is not a validation. The reads and the check live in one shared
-  `read_site_coordinates()` used by the six router branches that take a site (for Sky-Watcher
-  the catalog's per-field min/max applies the same range since #744), and on the
+  but a config can is not a validation. The check was one shared
+  `read_site_coordinates()` in the router, and is now each telescope schema's per-field range
+  (the catalog's min/max for Sky-Watcher since #744, a normalize check for iOptron), and on the
   persisted path the offending coordinate is **cleared** so the driver's unset handling covers it. `0.0` is a real coordinate, so the driver tracks whether each
   was ever set rather than testing for the value — an unset southern rig would otherwise
   run northern pointing math: the #432 sky frame (both the `a1` term and dec), the RA
@@ -138,8 +138,9 @@ datagrams before each send so replies cannot get off-by-one.
   sky hour angle; the Dec rate and guide signs read `branch` alone, because dec does not
   involve `eps`.
   Tracking, `RightAscensionRate` and East/West pulses go through `ra_axis_sign_locked()`
-  (counts up north, down south); `MoveAxis`, goto deltas and AutoHome are mechanical and
-  never apply it. With `eps = +1` this is `indi-eqmod`'s `EncodersToRADec()` in both
+  (counts up north, down south); goto deltas and AutoHome are mechanical and never apply
+  it. `MoveAxis` is sky-referenced instead (positive primary = east, positive secondary =
+  north; `sky_move_axis_rate_locked()`, open-astro#297). With `eps = +1` this is `indi-eqmod`'s `EncodersToRADec()` in both
   hemispheres (asserted in `test_skywatcher_pointing.cpp`); with `k = +1` it matches
   indi-eqmod in the north only and differs by 12 h in the south, and on the EQM-35 Pro
   the hardware backs this model, not indi-eqmod's default.
@@ -149,6 +150,7 @@ datagrams before each send so replies cannot get off-by-one.
   rows are in the driver comment and asserted in `test_skywatcher_pointing.cpp`. Extend
   that file with a new hardware row for any change here.
 - **Motion limits (#436) are off by default and soft.** `minAltitudeDeg` and `meridianLimitMinutes` live in the catalog descriptor (`skywatcher_fields.h`); `util::MotionLimits` (`util/motion_limits.h`) is the pure decision. Only `SlewToCoordinatesAsync` (and so `SlewToTargetAsync`; the router refuses the synchronous forms with `MethodNotImplemented`) check the altitude floor, throwing `InvalidValue`; Park, FindHome, MoveAxis, Sync and PulseGuide are exempt from that check. The live guard (`run_limit_guard()`, its own `util::AsyncOperation` slot) watches MoveAxis and tracking while a limit is set and stops them on an inside-to-outside crossing through `set_tracking(false)` and `move_axis(axis, 0.0)` with `mutex_` released; it is edge-triggered, skips gotos, Park and FindHome, and `cancel_async_tasks()` joins it first. ConformU runs with both limits off.
+- **Goto backlash compensation (#437) is off by default, covers gotos only, and is a fixed final approach.** `backlashStepsRA`/`backlashStepsDec` (microsteps, integer 0-100000, default 0) and `backlashEnabledRA`/`backlashEnabledDec` (default false) are in the catalog descriptor (`skywatcher_fields.h`) and the web form; a config without them behaves as before. Each axis has one approach side, fixed in `backlash_approach_sign_locked()`: RA the tracking direction of the site's hemisphere (counts up north, down south, as `ra_axis_sign_locked()`), Dec increasing counts. When an axis is enabled with steps > 0 and a goto's move on it runs against that side, `dispatch_goto_locked()` sends the fast `:S` goto that many counts past the target, and the landing wait (`wait_for_slew_complete()`, through `send_final_approach_locked()`) sends the final leg once the first leg has landed by the rule every landing follows: `get_hardware_slewing_locked()` reads it stopped (a failed status read keeps the last answer for up to 10 s) and its count holds still across `kLandingSettle` (`wait_axis_stationary_locked()`). The leg is a slow GOTO (`:G` mode `2`) through `dispatch_goto_locked()`, under the goto's own `motion_generation_` and on the owing axes only (so it opens with that dispatch's `:K`), in the approach direction back onto the unchanged target, at a speed derived from the board's own `:s` (worm steps; a sixteenth of a worm turn per second, held under the slow-mode ceiling) and `:a`. A goto already in the approach direction, or of under one count, sends the same commands as before. **The driver never writes the position register (`:E`) for compensation**: the register always counts the motor, so a reversal, compensated or not, leaves it at most one gear gap from the output shaft and nothing builds up. The first design took up the slack before the move and then put the register back with `:E`; tracking, guide pulses and MoveAxis reverse the axis without compensation and never undid that shift, so the reported position could drift by the slack on each cycle (review of #437). The owed final leg carries the goto's `motion_generation_`: an AbortSlew, a MoveAxis, a pulse or a newer goto bumps it and the leg is dropped unsent, and a landing wait that gives up sends nothing. An earlier version polled `:f` itself and sent the leg the moment it read stopped, which skipped both rules: one failed read failed the goto with the mount `steps` past the target, and a leg sent while the last counts still arrive lands in the EQM-35 Pro window `kLandingSettle` exists for (review of #437). Only gotos that end in `wait_for_slew_complete()` are compensated (sky gotos and their landing refinements, Park, the count-frame FindHome); the AutoHome hunt passes `compensate_backlash=false` and waits on its own loop. The final leg runs while tracking is stopped and after the RA aim-ahead target was computed, so its duration shows up as RA lag at landing; a two-leg landing is not taken as a sample of `goto_overhead_seconds_`. `:s` is read at connect only for an enabled axis; a board that rejects it (Wave 100i) or answers 0 (EQ-AL55i) leaves that axis uncompensated with a WARN. **Guide pulses (`PulseGuide`) and rate motion (`MoveAxis`, `RightAscensionRate`/`DeclinationRate`) are deliberately not compensated** (CTO decision): autoguiders (PHD2 Dec backlash compensation, NINA) measure and correct backlash themselves, so a driver-side compensation would double it and make the guider oscillate, and a continuous move has no target to land on. A later issue may add rate or pulse compensation behind its own flag. Tests: `test_skywatcher_backlash.cpp`, over the fake mount's gear gap (`set_gear_gap()`, `shaft_degrees()`), which separates the motor the register counts from the shaft the sky sees, a coasting landing (`land_short_by()`, `commands_while_coasting()`) and a failed status read (`fail_status_replies()`).
 - The driver's blocking `slew_to_coordinates()` is not reachable over HTTP (the router refuses the synchronous slews with `MethodNotImplemented`). Called directly, one superseded by another generation-changing motion can throw `InvalidOperation` while the hardware GOTO continues to its target; the error reports that the synchronous wait lost ownership and does not prove the mount stopped.
 - **Sync** uses the controller's own `:E` set-position command (motors must be fully
   stopped — the driver pauses tracking around the write), never a driver-side offset.
@@ -657,7 +659,7 @@ against its checklist, 2026-09-06:
 - [ ] ConformU 4.5.x on a classic mount — blocked on Pi 5 hardware availability; not the
   EQM-35 specifically, but the issue's ask applies equally.
 - [x] Fake mount test double extended with a classic-board profile: `FakeMountProfile::eqm35_pro()`
-  in `AlpacaCore/tests/fake_skywatcher_mount.h` is a REAL EQM-35 Pro capture (its built-in PL2303
+  in `AlpacaCore/tests/fake_skywatcher_board.h` is a REAL EQM-35 Pro capture (its built-in PL2303
   port answers only at 115200), used by the `[eqm35]`-tagged cases in
   `AlpacaCore/tests/test_skywatcher_async.cpp`: identity from the mount code, the count-frame
   FindHome fallback, the board's own sidereal period, and the `[hemisphere]` southern-hemisphere
@@ -838,16 +840,18 @@ and each time the assertion itself was the review finding.
     read under the pre-#432 model, where `d(HA)/d(a1)` did not flip below the equator.
     The same mechanical button now moves reported RA the other way at this site. What
     the rows still establish is the mechanical fact, which way each button turns which
-    axis; only the RA/Dec labels on them changed. `move_axis()` applies NO branch or hemisphere sign
-    transform (the rate goes straight to `start_speed_motion_locked`), so this is
+    axis; only the RA/Dec labels on them changed. At that time `move_axis()` applied NO branch or hemisphere sign
+    transform (the rate went straight to `start_speed_motion_locked`; since #297 it
+    maps the sky-referenced rate through `sky_move_axis_rate_locked()`), so this is
     also the hardware reference for which way a raw Dec-axis rate moves reported
     Dec below the equator -- the fact the DeclinationRate/PulseGuide fix below
     rests on. Reported coordinates come from the driver's own pointing model; the
-    independent sky check (plate solve, 2026-09-24) is below. Do NOT "fix"
-    MoveAxis to follow sky Dec: the ASCOM spec says the sign of the Rate parameter
-    "is purposely left undefined" and the motion is about the MECHANICAL axis, so
-    the no-transform behaviour is correct in both hemispheres (checked against
-    ascom-standards.org/newdocs/telescope.html#Telescope.MoveAxis, 2026-09-06).
+    independent sky check (plate solve, 2026-09-24) is below. **Superseded by
+    open-astro#297 (CTO decision):** the ASCOM spec leaves the sign of the Rate
+    parameter undefined, but clients (NINA) assume sky directions, so `move_axis()`
+    now maps its rate through `sky_move_axis_rate_locked()` (positive primary =
+    east, positive secondary = north, as `indi-eqmod`). The rows above remain the
+    mechanical reference for the raw axis rate underneath.
   - **Tracking rate measured at 0.99995x sidereal over 5 minutes** (-46 ppm,
     -2.5 arcsec/hour, against a +/-31 ppm encoder-quantisation floor), Dec drift
     exactly 0 counts. Ten consecutive 30 s intervals of -3214 counts, +/-1. The
@@ -907,7 +911,8 @@ and each time the assertion itself was the review finding.
     gap above. Key realization (2026-09-07): `a2` is the raw Dec-axis angle relative to
     home (see `compute_ra_dec_locked()`) and is NOT coupled to the RA axis at all, so the
     `a2 < 0` branch does not require an actual GOTO across the meridian -- the same
-    `MoveAxis` bench technique already used for `a2 > 0` reaches it directly, mirrored:
+    `MoveAxis` bench technique already used for `a2 > 0` reaches it directly, mirrored
+    (`MoveAxis` is sky-referenced since #297: judge by `a2`, not by the sign of the rate):
     1. `Connected=true`, tracking on at sidereal, OTA mounted, daylight is fine (same
        setup as the `a2 > 0` session, 2026-09-06).
     2. `MoveAxis` the Dec axis to roughly **-0.5 deg from home** (the OPPOSITE direction
@@ -959,8 +964,8 @@ equator the rule was backwards on BOTH dec-axis branches. The full sign table:
 **Why it survived.** The Wave 100i was ConformU-validated in the northern hemisphere,
 where the rule is right, and the ConformU measured-rate tests that "confirmed" the sign
 ran there. The southern-hemisphere hardware session (2026-09-06) exercised tracking and
-`MoveAxis` -- and `move_axis()` applies no sign transform at all, so it was never
-exposed to this rule.
+`MoveAxis` -- and at that time `move_axis()` applied no sign transform at all, so it was never
+exposed to this rule (since #297 it applies the same branch/hemisphere XOR).
 
 **Fix (done).** Both call sites now negate when
 `(branch_from_axis_locked(a2) > 0) != hemisphere_south_locked()` (XOR), which reproduces the

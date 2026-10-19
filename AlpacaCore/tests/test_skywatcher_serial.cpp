@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -153,6 +154,73 @@ TEST_CASE("SkyWatcher serial - giving up on a second mis-pair still settles the 
     link.board.set_counts(1, 0x812345);
     // The next inquiry must get its OWN reply, not the straggler.
     REQUIRE(link.proto.inquire_position(1) == 0x812345);
+}
+
+TEST_CASE("SkyWatcher serial - giving up on a second malformed reply throws the Malformed refusal",
+          "[skywatcher][serial]") {
+    // Two byte-dropped replies in a row: the wrapper resends once, then gives up
+    // with the "Malformed" refusal (not "Mis-paired"), and the next inquiry is
+    // answered by its own reply. (This fake sends no straggler after a malformed
+    // reply, so the settle itself is pinned by the mis-pair case above.)
+    SerialLink link(300);
+    link.board.set_counts(1, 0x800000);
+    link.board.malform_next(2);
+    try {
+        (void)link.proto.inquire_position(1);
+        FAIL("expected a malformed-reply refusal");
+    } catch (const alpacacore::AlpacaException& e) {
+        CHECK(std::string(e.what()).find("Malformed motor controller reply") != std::string::npos);
+    }
+    REQUIRE(link.board.count_frames('j') == 2);  // one resend, then gave up
+
+    link.board.set_counts(1, 0x812345);
+    REQUIRE(link.proto.inquire_position(1) == 0x812345);
+}
+
+TEST_CASE("SkyWatcher serial - the settle drain keeps polling after a spurious-readable EAGAIN",
+          "[skywatcher][serial]") {
+    // poll() can report a tty readable while the read that follows yields EAGAIN.
+    // settle_serial used to end the drain there, so a straggler that arrived after
+    // that point survived the settle and could pass the next shape check. Model the
+    // spurious wakeups through the read seam (two EAGAINs while armed) and require
+    // the drain to go on until the straggler is consumed.
+    FakeSkyWatcherSerialBoard board;
+    // The two mis-paired replies are "=00\r" each (8 one-byte reads). The EAGAINs
+    // start once those are consumed, i.e. inside the give-up settle, where the
+    // straggler lands 50 ms after the second reply.
+    constexpr int kReplyBytes = 8;
+    std::atomic<bool> armed{false};
+    std::atomic<int> ok_reads{0};
+    std::atomic<int> eagain_left{2};
+    std::atomic<int> settle_reads{0};
+    auto spurious_read = [&](int fd, char* buf, std::size_t n) -> std::ptrdiff_t {
+        if (armed.load() && ok_reads.load() >= kReplyBytes) {
+            ++settle_reads;
+            if (eagain_left.load() > 0) {
+                --eagain_left;
+                errno = EAGAIN;
+                return -1;
+            }
+        }
+        const auto r = ::read(fd, buf, n);
+        if (armed.load() && r > 0) ++ok_reads;
+        return r;
+    };
+    sw::SkyWatcherProtocolWrapper proto{spurious_read};
+    sw::ConnectionInfo info;
+    info.type = sw::ConnectionType::Serial;
+    info.port_path = board.slave_path();
+    info.baud_rate = 9600;
+    info.response_timeout_ms = 300;
+    REQUIRE(proto.connect(info));
+    board.set_counts(1, 0x800000);
+    board.mispair_next(2, "=800000", 50);
+    armed = true;
+    REQUIRE_THROWS_AS(proto.inquire_position(1), alpacacore::AlpacaException);
+    CHECK(eagain_left.load() == 0);
+    // Two EAGAINs, then the straggler's bytes: the drain went on past the first.
+    CHECK(settle_reads.load() > 2);
+    proto.disconnect();
 }
 
 TEST_CASE("SkyWatcher serial - a quiet board times out within the command budget, not the broken-read block",
@@ -596,22 +664,16 @@ TEST_CASE("SkyWatcher serial - Connected=true on a stale link reconnects instead
     driver->set_connected(true);
     CHECK(board->frames().size() == frames_before);
 
-    // Captured BEFORE sever_link(): PtyPair::sever() clears slave_path_, so
-    // reading it off `board` after severing would always be empty and the
-    // guard below would compare against "" -- true for any pty and unable
-    // to catch the reorder it exists to catch.
-    const std::string old_path = board->slave_path();
-    board->sever_link();
     // devpts assigns st_ino = index + 3, so link_alive() would call a
-    // recycled index the same node -- this only works because the driver
-    // still holds `board`'s old slave fd here, which keeps devpts from
-    // reusing its index before `replugged` is constructed below. Do not
-    // reorder sever_link() / construction / repoint().
+    // recycled index the same node. The test owns the old index itself: the
+    // replacement is built while `board` still holds its master, so the index
+    // cannot be reused whatever the driver's reader does with its own fd
+    // (open-astro#1245). old_path is captured first because PtyPair::sever()
+    // clears slave_path_.
+    const std::string old_path = board->slave_path();
     FakeSkyWatcherSerialBoard replugged;
-    // Self-checking: if a future edit moves construction earlier or drops the
-    // driver's fd first, devpts could recycle the index and hand back the
-    // severed board's own path, which would let this case pass vacuously.
     REQUIRE(replugged.slave_path() != old_path);
+    board->sever_link();
     link.repoint(replugged.slave_path());
     REQUIRE(replugged.frames().empty());
 
@@ -1238,17 +1300,19 @@ namespace {
 
 // Relink under the same by-id style symlink, as udev does: sever the board,
 // stand up a replacement, repoint. Returns the replacement, which the caller
-// keeps alive. Ordering matters for devpts index reuse — see the #445 case.
+// keeps alive. The replacement is built first so devpts cannot reuse the old
+// index — see the #445 case.
 std::unique_ptr<FakeSkyWatcherSerialBoard> relink_board(std::unique_ptr<FakeSkyWatcherSerialBoard>& board,
                                                         const PortLink& link, alpacacore::TelescopeDriver& driver) {
+    // The test owns the severed board's pty index itself: the replacement is
+    // built while `board` still holds its master, so devpts cannot hand back
+    // the old path whatever the driver does. Building it after sever_link()
+    // depended on the driver's fd outliving the loss, which its reader can
+    // close at any moment (open-astro#1245).
     const std::string old_path = board->slave_path();
-    board->sever_link();
-    // Stand the replacement up BEFORE anything observes the loss: noticing it
-    // closes the driver's fd, and that fd is the only thing keeping devpts
-    // from recycling the severed board's index and handing back its own path
-    // (the #445 case documents the same ordering hazard). Do not reorder.
     auto replugged = std::make_unique<FakeSkyWatcherSerialBoard>();
     REQUIRE(replugged->slave_path() != old_path);
+    board->sever_link();
     // Observing the loss is what stamps it, and the stamp is what the relink
     // decision measures its outage from.
     CHECK_FALSE(driver.get_connected());

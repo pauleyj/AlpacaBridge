@@ -35,6 +35,7 @@
 #include <numbers>
 #include <optional>
 #include <thread>
+#include <tuple>
 
 namespace alpacacore::vendor::skywatcher {
 
@@ -316,7 +317,8 @@ public:
                               util::ConnectionResolver<ConnectionInfo> connection_resolver = {},
                               util::MotionLimits motion_limits = {},
                               util::TaskClock& clock = util::default_task_clock(),
-                              DecAxisSenseSetting dec_axis_sense_setting = DecAxisSenseSetting::Auto)
+                              DecAxisSenseSetting dec_axis_sense_setting = DecAxisSenseSetting::Auto,
+                              BacklashSettings backlash = {})
         : AsyncConnectable("SkyWatcher"),
           device_number_(device_number),
           connection_info_(connection_info),
@@ -332,7 +334,8 @@ public:
           // only the optionals know, and only here.
           site_latitude_set_(site_latitude_deg.has_value()),
           site_longitude_set_(site_longitude_deg.has_value()),
-          dec_axis_sense_setting_(dec_axis_sense_setting) {
+          dec_axis_sense_setting_(dec_axis_sense_setting),
+          backlash_(backlash) {
         guide_rate_.ra = kDefaultGuideRateDegPerSec;
         guide_rate_.dec = kDefaultGuideRateDegPerSec;
         // Decision 0009: the staleness bound and link-lost stamp run on the
@@ -606,6 +609,7 @@ public:
             try {
                 axis_params_[0] = protocol.get_axis_parameters(kAxisRa);
                 axis_params_[1] = protocol.get_axis_parameters(kAxisDec);
+                read_backlash_rates_locked(protocol);
 
                 // Feature inquiry (":q" data 0x000001): bit 0x04 = home index
                 // sensor. Wave 100i reports it on both axes (0x100C); older
@@ -899,6 +903,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         check_connected();
         throw_if_link_faulted_locked();  // open-astro#882: commanded state, not a wire read
+        settle_unconfirmed_tracking_stop_locked();
         return tracking_;
     }
 
@@ -1154,7 +1159,8 @@ public:
         // used to write the rate captured at dispatch, which made even the
         // RA skip unsafe while autoguiding: PHD2 kept the old whole-mount
         // pulse_guiding_active_ flag (then shared by both axes) true for
-        // most of every guide cycle), and the MoveAxis stop task
+        // most of every guide cycle) and decides the direction once more
+        // under the lock that releases the axis, and the MoveAxis stop task
         // re-applies the Dec offset for a Dec nudge. So a whole-mount skip
         // let a DEC-axis operation in flight (a North/South pulse, or
         // MoveAxis(Dec, r) -> MoveAxis(Dec, 0)) block the RA re-apply while
@@ -1700,6 +1706,31 @@ public:
                     pulse_axis_in_motion_[ai] = false;
                 }
             };
+            // The pulse owns RA until it lets go here, and set_site_latitude()
+            // skips a busy RA axis, so a crossing after the restore's last
+            // direction decision (inside the post-stop rate check, or between
+            // a dispatch-failure recovery and this release) was never
+            // applied. Decide again under the lock that hands the axis back.
+            // Not for a cancelled pulse (its reaper owns the axes) or a failed
+            // stop (nothing was restored).
+            auto release_pulse_locked = [this, axis, ai, my_seq, &stopped_by_other,
+                                         &end_pulse_locked](std::unique_lock<std::mutex>& lock) {
+                if (axis == kAxisRa && pulse_seq_[ai] == my_seq && connected_ && !stopped_by_other() &&
+                    tracking_effectively_on_locked() && ra_duty_rate_deg_s_ == 0.0 && cmd_axis_rate_deg_s_[0] != 0.0 &&
+                    (effective_ra_rate_locked() > 0.0) != (cmd_axis_rate_deg_s_[0] > 0.0)) {
+                    try {
+                        restart_ra_in_current_direction_locked(lock);
+                    } catch (const std::exception& e) {
+                        if (!lock.owns_lock()) {
+                            lock.lock();
+                        }
+                        ALPACA_LOG_WARN(
+                            "SkyWatcher",
+                            std::string("Pulse end: failed to turn RA round after a hemisphere change: ") + e.what());
+                    }
+                }
+                end_pulse_locked();
+            };
             // PulseGuide is an asynchronous initiator (ITelescopeV4): the axis
             // dispatch (which can stop-and-wait a ramping axis, plus UDP
             // retries) runs here so pulse_guide() returns inside the STANDARD
@@ -1721,22 +1752,21 @@ public:
                 if (!ra_live_write_sent) {
                     return;
                 }
-                // Deliberately NOT given stop_axis()'s ra_reverses branch: it
-                // writes ":I" + ":J" in place with no ":G", so a re-derived
-                // rate whose SIGN differs from the running one changes the
-                // period and leaves the axis turning the old way. Reached only
-                // when the dispatch ":J" throws after the ":I" went out, and a
-                // pure hemisphere flip preserves the magnitude, so the practical
-                // exposure is a period that is already correct. Recorded so the
-                // asymmetry with stop_axis() reads as a choice rather than an
-                // oversight (round-4 review note).
+                detail::run_pulse_dispatch_failure_hook();
                 constexpr int kRestoreAttempts = 3;
                 std::string last_error;
                 for (int attempt = 0; attempt < kRestoreAttempts; ++attempt) {
                     try {
-                        std::lock_guard<std::mutex> lock(mutex_);
+                        std::unique_lock<std::mutex> lock(mutex_);
                         const double restore_rate = effective_ra_rate_locked();
                         auto& proto = *protocol_;
+                        if ((restore_rate > 0.0) != (cmd_axis_rate_deg_s_[0] > 0.0)) {
+                            // A SiteLatitude write crossed the equator since the
+                            // ":I" went out: an in-place ":I" cannot turn the axis
+                            // round, so stop and restart it in the new direction.
+                            restart_ra_in_current_direction_locked(lock);
+                            return;
+                        }
                         proto.set_step_period(kAxisRa, tracking_step_period_for(restore_rate),
                                               /*with_readback=*/false);
                         if (live_rate_relatch_) {  // open-astro#666
@@ -1820,14 +1850,14 @@ public:
             } catch (const std::exception& e) {
                 ALPACA_LOG_WARN("SkyWatcher", std::string("PulseGuide dispatch failed: ") + e.what());
                 recover_ra_drive_rate();
-                std::lock_guard<std::mutex> lock(mutex_);
-                end_pulse_locked();
+                std::unique_lock<std::mutex> lock(mutex_);
+                release_pulse_locked(lock);
                 return;
             } catch (...) {
                 ALPACA_LOG_WARN("SkyWatcher", "PulseGuide dispatch failed with unknown exception");
                 recover_ra_drive_rate();
-                std::lock_guard<std::mutex> lock(mutex_);
-                end_pulse_locked();
+                std::unique_lock<std::mutex> lock(mutex_);
+                release_pulse_locked(lock);
                 return;
             }
             // open-astro#770: Tracking=false landed while a rate check below
@@ -1950,7 +1980,7 @@ public:
                     if (live_rate_relatch_) {
                         proto.start_motion(kAxisRa);
                     }
-                    std::lock_guard<std::mutex> lock(mutex_);
+                    std::unique_lock<std::mutex> lock(mutex_);
                     // Fold the pulse rate into the model up to now first: a
                     // rate change applied from an older anchor (one the limit
                     // guard takes mid-pulse) drops the pulse distance driven
@@ -1961,6 +1991,15 @@ public:
                     // pulse.
                     anchor_model_locked();
                     cmd_axis_rate_deg_s_[0] = ra_restore_rate_deg_per_sec;
+                    // A SiteLatitude write skips the busy RA axis because this
+                    // restore re-derives the rate, but the read above and the
+                    // ":I" writes ran in separate lock scopes: a crossing in
+                    // between left the axis turning the old way. Decide again
+                    // under this lock and turn it round if the sense moved.
+                    const double fresh_rate = effective_ra_rate_locked();
+                    if ((fresh_rate > 0.0) != (ra_restore_rate_deg_per_sec > 0.0)) {
+                        applied_ra_restore_rate = restart_ra_in_current_direction_locked(lock);
+                    }
                     // The ":J" above can land inside a Tracking=false
                     // stop-wait (after its ":K"): stop RA again now, not
                     // after the verify below.
@@ -1969,7 +2008,7 @@ public:
                     // Reversed pulse, or a hemisphere change mid-pulse: full
                     // stop-and-restart back to the drive rate.
                     std::unique_lock<std::mutex> lock(mutex_);
-                    start_speed_motion_locked(lock, kAxisRa, ra_restore_rate_deg_per_sec);
+                    applied_ra_restore_rate = restart_ra_in_current_direction_locked(lock);
                 } else {
                     proto.stop_motion(axis);
                     // Zero the dead-reckoning rate: this direct stop bypasses
@@ -2057,14 +2096,14 @@ public:
                 // for false and then wrote DeclinationRate/RightAscensionRate
                 // took the busy-axis deferral and waited on a restore this
                 // task had already run: the write was stranded.
-                std::lock_guard<std::mutex> lock(mutex_);
+                std::unique_lock<std::mutex> lock(mutex_);
                 // open-astro#770: Tracking=false after the restore, either
                 // during the rate check above or between stop_axis()'s
                 // tracking_ read and its unlocked ":I"+":J".
                 if (restore_still_wanted) {
                     stop_ra_if_tracking_off_locked();
                 }
-                end_pulse_locked();
+                release_pulse_locked(lock);
             }
             if (!stopped) {
                 ALPACA_LOG_ERROR("SkyWatcher", "PulseGuide STOP FAILED after " + std::to_string(kStopAttempts) +
@@ -2371,6 +2410,22 @@ public:
         return axis == 0 || axis == 1;
     }
 
+    // MoveAxis is sky-referenced (INDI indi-eqmod parity, open-astro#297):
+    // positive primary = east (RightAscension rises), positive secondary =
+    // north (Declination rises), in both hemispheres and on both pier sides,
+    // so a client needs no reverse toggle. Maps the ASCOM rate onto the
+    // signed AXIS rate the mechanical layer expects. RA: tracking turns the
+    // axis in ra_axis_sign_locked() to raise the hour angle, and east lowers
+    // it. Dec: same XOR as pulse_guide() North and apply_dec_rate_offset_locked().
+    double sky_move_axis_rate_locked(int axis, double rate) const {
+        if (axis == 0) {
+            return -ra_axis_sign_locked() * rate;
+        }
+        // No board read: MoveAxis is an asynchronous initiator. The branch flips only across the pole,
+        // and the connect and the status poll keep cached_dec_axis_deg_ current.
+        return (branch_from_axis_locked(cached_dec_axis_deg_) > 0) != hemisphere_south_locked() ? -rate : rate;
+    }
+
     void move_axis(int axis, double rate) override {
         // axis is not validated until the lock below: nothing indexes the
         // per-axis stop slots before it has been.
@@ -2427,7 +2482,7 @@ public:
                 if (from_rest) {
                     seed_limit_guard_baseline_locked();
                 }
-                start_speed_motion_locked(lock, channel, rate, /*anchor_model=*/true);
+                start_speed_motion_locked(lock, channel, sky_move_axis_rate_locked(axis, rate), /*anchor_model=*/true);
                 manual_axis_slewing_[axis] = true;
                 started = true;
             } else if (manual_axis_slewing_[axis]) {
@@ -2590,9 +2645,15 @@ public:
         // and the refine loop exits promptly -- without this, the refinement
         // re-slews after the abort's stop).
         slew_.cancel();
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         check_writable_locked();
         check_not_fully_parked_locked("AbortSlew");
+        // ITelescopeV4: aborting a MoveAxis returns Tracking to the state it
+        // had before the move. A jog leaves tracking_ as it found it, so that
+        // state is still tracking_ here.
+        const bool restore_tracking = tracking_effectively_on_locked() &&
+                                      (manual_axis_slewing_[0] || manual_axis_slewing_[1]) && !goto_in_progress_ &&
+                                      !parking_ && !homing_;
         // AbortSlew is itself a motion command: bump the generation so any
         // stop-wait sleeping in an unlock window observes the supersession
         // and its dispatch aborts BEFORE sending new motor commands (the
@@ -2621,6 +2682,28 @@ public:
         restore_tracking_after_slew_ = false;
         tracking_ = false;
         invalidate_position_cache_locked();
+        bool need_duty = false;
+        bool restarted = false;
+        if (restore_tracking) {
+            try {
+                set_tracking_locked(lock, true);
+            } catch (const std::exception& e) {
+                ALPACA_LOG_WARN("SkyWatcher", std::string("AbortSlew: failed to restore tracking: ") + e.what());
+            }
+            need_duty = tracking_ && (ra_duty_rate_deg_s_ != 0.0 || dec_duty_rate_deg_s_ != 0.0);
+            restarted = tracking_;
+        }
+        lock.unlock();
+        // As in set_tracking(): the restore's RA stop-wait releases mutex_
+        // while tracking_ reads false, and a limit guard polling in that window
+        // exits, so start it (and the duty worker) again for the restored
+        // tracking.
+        if (need_duty) {
+            start_duty_worker();
+        }
+        if (restarted) {
+            start_limit_guard();
+        }
     }
 
     void slew_to_alt_az(double altitude, double azimuth) override {
@@ -2895,6 +2978,7 @@ private:
         parked_ = false;
         at_home_ = false;
         tracking_ = false;
+        tracking_stop_unconfirmed_ = false;
         restore_tracking_after_slew_ = false;
         pulse_axis_active_[0] = false;
         pulse_axis_active_[1] = false;
@@ -2954,8 +3038,9 @@ private:
     // (tracking, RightAscensionRate, East/West guide pulses): increasing
     // counts north of the equator, decreasing south of it, because the mount
     // faces the opposite pole and ha = -ha_mech there (pointing-model
-    // comment). Mechanical motion -- MoveAxis, goto deltas, AutoHome -- never
-    // applies this: a signed axis rate means the same thing everywhere.
+    // comment). Mechanical motion -- goto deltas, AutoHome -- never applies
+    // this: a signed axis rate means the same thing everywhere. MoveAxis is
+    // sky-referenced and maps its rate through sky_move_axis_rate_locked().
     double ra_axis_sign_locked() const { return hemisphere_south_locked() ? -1.0 : 1.0; }
 
     int override_dec_axis_sense() const { return dec_axis_sense_setting_ == DecAxisSenseSetting::Reversed ? -1 : +1; }
@@ -3211,8 +3296,13 @@ private:
         return {ra, std::clamp(dec, -90.0, 90.0)};
     }
 
-    std::pair<double, double> ra_dec_to_axis_degrees_locked(double ra, double dec,
-                                                            double lst_advance_hours = 0.0) const {
+    // forced_branch: the dec-axis branch (+1/-1, pointing_branch_) to aim at
+    // instead of the one the hour angle picks. The landing check passes the
+    // branch the goto was dispatched on: the dispatch picks it at LST + aim
+    // ahead, so a target within the aim-ahead of HA = 0 would otherwise read
+    // as the other branch at the current LST and draw futile re-gotos.
+    std::pair<double, double> ra_dec_to_axis_degrees_locked(double ra, double dec, double lst_advance_hours = 0.0,
+                                                            int forced_branch = 0) const {
         double lst = compute_local_sidereal_time_hours(utc_now_locked(), site_longitude_) + lst_advance_hours;
         double ha = wrap_hour_angle(lst - ra);
         const double sky_sign = hemisphere_south_locked() ? -1.0 : 1.0;
@@ -3225,7 +3315,7 @@ private:
         // get_destination_side_of_pier() states it directly, so all three
         // agree by construction.
         const double k = home_term_sign_locked();
-        const double side = ha >= 0.0 ? 1.0 : -1.0;
+        const double side = forced_branch != 0 ? k * static_cast<double>(forced_branch) : (ha >= 0.0 ? 1.0 : -1.0);
         const double branch = k * side;
         const double a2 = branch * (90.0 - dec_mech);
         // HA = sky_sign * a1/15 + k * 6 * branch, inverted. k * branch is the
@@ -4081,8 +4171,9 @@ private:
         const bool fast = std::abs(signed_rate_deg_per_sec) > kFastModeThresholdDegPerSec;
         // Motion mode: '1' = speed slow, '3' = speed fast.
         // No hemisphere handling HERE: this is the mechanical layer, and a
-        // signed axis rate means the same thing everywhere (MoveAxis and
-        // AutoHome depend on that). The hemisphere's RA sense for tracking,
+        // signed axis rate means the same thing everywhere (AutoHome and
+        // the goto deltas depend on that; MoveAxis maps its sky-referenced
+        // rate onto it first, sky_move_axis_rate_locked()). The hemisphere's RA sense for tracking,
         // RightAscensionRate and East/West pulses is applied by the callers
         // through ra_axis_sign_locked() -- see effective_ra_rate_locked() and
         // the pointing-model comment. (#250 had removed a flip from this
@@ -4096,6 +4187,25 @@ private:
             advance_model_anchor_locked();
         }
         cmd_axis_rate_deg_s_[channel - 1] = rate;
+    }
+
+    // Stop-and-restart RA at the drive rate, re-deriving the rate after every
+    // unlock. start_speed_motion_locked() releases `mutex_` while it waits for
+    // the stop, and a pulse holding the RA axis makes set_site_latitude() skip
+    // it, so an equator crossing inside that wait would otherwise leave RA
+    // latched in the old hemisphere's direction. Bounded: each pass needs a
+    // further crossing to repeat. Returns the rate actually applied.
+    double restart_ra_in_current_direction_locked(std::unique_lock<std::mutex>& lock) {
+        constexpr int kMaxPasses = 4;
+        double applied = effective_ra_rate_locked();
+        for (int pass = 0; pass < kMaxPasses; ++pass) {
+            applied = effective_ra_rate_locked();
+            start_speed_motion_locked(lock, kAxisRa, applied);
+            if ((effective_ra_rate_locked() > 0.0) == (cmd_axis_rate_deg_s_[0] > 0.0)) {
+                break;
+            }
+        }
+        return applied;
     }
 
     // Base drive rate for the selected ASCOM DriveRate.
@@ -4142,22 +4252,17 @@ private:
     // Dec rises under +DeclinationRate / a North pulse; not yet measured on
     // hardware below the equator (a guiding session or plate-solved drift
     // run would do it). XOR-ing the branch test with the hemisphere is the
-    // full fix: MoveAxis, which applies no sign transform at all, is the
-    // hardware-observed reference for which way a raw axis rate moves
-    // reported Dec (.github/instructions/skywatcher.instructions.md, EQM-35 Pro at latitude -37.2).
-    // The sign is evaluated once at (re)apply time and held: it is NOT
-    // re-evaluated as this offset's own motion carries the axis across the
-    // branch boundary (a2 through 0). This was tracked as a bug for a while
-    // (open-astro#255, deferred from #214) and even implemented -- and the
-    // "fix" made the axis reverse and oscillate right at the crossing,
-    // breaking the "DeclinationRate drives Dec with the east-branch sign"
-    // loopback test, which asserts a HELD sign for exactly this case.
-    // a2 = 0 is the celestial pole in this driver's convention (dec = 90 at
-    // a2 = 0 on both branches): continuing a raw axis motion through it
-    // necessarily produces a real cusp in reported Dec (it rises to 90 then
-    // falls), on any correctly-behaving mount -- confirmed on hardware during
-    // the EQM-35 Pro bring-up ("at a2 = 0, reported Dec rises for EITHER
-    // mechanical direction", see .github/instructions/skywatcher.instructions.md). Holding the sign is what
+    // full fix: MoveAxis, which then applied no sign transform at all (since #297 it does), is the
+    // hardware-observed reference for which way a raw axis rate moves reported Dec
+    // (.github/instructions/skywatcher.instructions.md, EQM-35 Pro at latitude -37.2). The sign is evaluated once at
+    // (re)apply time and held: it is NOT re-evaluated as this offset's own motion carries the axis across the branch
+    // boundary (a2 through 0). This was tracked as a bug for a while (open-astro#255, deferred from #214) and even
+    // implemented -- and the "fix" made the axis reverse and oscillate right at the crossing, breaking the
+    // "DeclinationRate drives Dec with the east-branch sign" loopback test, which asserts a HELD sign for exactly this
+    // case. a2 = 0 is the celestial pole in this driver's convention (dec = 90 at a2 = 0 on both branches): continuing
+    // a raw axis motion through it necessarily produces a real cusp in reported Dec (it rises to 90 then falls), on any
+    // correctly-behaving mount -- confirmed on hardware during the EQM-35 Pro bring-up ("at a2 = 0, reported Dec rises
+    // for EITHER mechanical direction", see .github/instructions/skywatcher.instructions.md). Holding the sign is what
     // produces that correct cusp; dynamically flipping it to keep reported
     // Dec monotonic would be fighting the mount's own geometry. Closed as
     // not a bug: see open-astro#255 for the full derivation. Every real
@@ -4418,10 +4523,34 @@ private:
         }
     }
 
+    // A Tracking=false whose stop-wait threw left tracking_ true. Once a poll
+    // measured after that throw shows the RA axis stopped, the stop did land:
+    // Tracking must not read true for a stopped axis. Served from the polled
+    // frame, never the board (decision 0010). Only while that stop still owns
+    // RA: a newer motion command (generation bump) or a pulse, slew or
+    // tracking restore holding RA stopped took the axis over, and settling
+    // then would end the limit guard while a slew is set to restore tracking.
+    void settle_unconfirmed_tracking_stop_locked() const {
+        if (!tracking_stop_unconfirmed_ || !tracking_) {
+            return;
+        }
+        if (motion_generation_ != tracking_stop_unconfirmed_gen_ || axis_busy_locked(kAxisRa) || restoring_tracking_) {
+            return;
+        }
+        const auto reading = snapshot_.read();
+        if (reading && reading->measured_at > tracking_stop_unconfirmed_since_ && reading->value.status_current &&
+            !reading->value.ra_running) {
+            tracking_ = false;
+            tracking_stop_unconfirmed_ = false;
+            restore_tracking_after_slew_ = false;  // no restore without tracking_ (restore_tracking_after_slew_locked)
+        }
+    }
+
     void set_tracking_locked(std::unique_lock<std::mutex>& lock, bool tracking) {
         // Tracking off stops the RA axis: a pending rate-applied check must
         // not resend its ":I"+":J" into the stopped axis and restart it.
         cancel_rate_verify_locked();
+        tracking_stop_unconfirmed_ = false;
         if (tracking) {
             // Track: RA axis in the direction of increasing SKY hour angle
             // (increasing counts north of the equator, decreasing south of
@@ -4437,7 +4566,20 @@ private:
                 ~PendingOffGuard() { --depth; }
             } pending_off_guard{tracking_off_pending_};
             ++tracking_off_pending_;
-            if (!stop_axis_and_wait_locked(lock, kAxisRa, gen)) {
+            bool stopped = false;
+            try {
+                stopped = stop_axis_and_wait_locked(lock, kAxisRa, gen);
+            } catch (...) {
+                // The ":K" went out and the commanded rate is already zero, but
+                // the stop was not confirmed: Tracking keeps reading true while
+                // the axis may still move, and get_tracking() drops it once a
+                // poll taken after this point sees RA stopped.
+                tracking_stop_unconfirmed_ = true;
+                tracking_stop_unconfirmed_since_ = clock_.now();
+                tracking_stop_unconfirmed_gen_ = gen;
+                throw;
+            }
+            if (!stopped) {
                 // A newer motion command took the axes while the mutex was
                 // released: it owns the tracking state now — do not stomp it.
                 throw AlpacaException("Tracking change superseded by a concurrent motion command");
@@ -4457,10 +4599,92 @@ private:
         invalidate_position_cache_locked();
     }
 
-    void dispatch_goto_locked(std::unique_lock<std::mutex>& lock, double target_ra_axis_deg,
-                              double target_dec_axis_deg) {
+    // open-astro#437: ":s" is read once at connect, and only for an axis that
+    // asked for compensation, so a config without backlash sends the same
+    // connect stream as before. A board that rejects ":s" (Wave 100i) or
+    // answers 0 (EQ-AL55i) gives no worm count to derive a speed from: that axis
+    // stays uncompensated, loudly.
+    void read_backlash_rates_locked(SkyWatcherProtocolWrapper& protocol) {
+        backlash_rate_deg_s_[0] = backlash_rate_deg_s_[1] = 0.0;
+        const BacklashSettings::Axis* cfg[2] = {&backlash_.ra, &backlash_.dec};
+        for (int channel = kAxisRa; channel <= kAxisDec; ++channel) {
+            if (!cfg[channel - 1]->active()) {
+                continue;
+            }
+            uint32_t worm = 0;
+            try {
+                worm = protocol.get_steps_per_worm(channel);
+            } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch)
+                // Rejected: handled with the zero case below.
+            }
+            if (worm == 0) {
+                ALPACA_LOG_WARN("SkyWatcher", std::string("Backlash compensation on the ") +
+                                                  (channel == kAxisRa ? "RA" : "Dec") +
+                                                  " axis is off: the board reports no worm step count (':s'), so "
+                                                  "there is no speed to derive (open-astro#437)");
+                continue;
+            }
+            // INDI's way: the speed follows the worm. A sixteenth of a worm turn
+            // per second, held under the slow-mode ceiling so the final leg is
+            // a plain slow GOTO.
+            const double deg_per_s = 360.0 * kBacklashWormTurnsPerSecond * worm /
+                                     static_cast<double>(axis_params_[channel - 1].counts_per_revolution);
+            backlash_rate_deg_s_[channel - 1] = std::min(deg_per_s, kFastModeThresholdDegPerSec);
+        }
+    }
+
+    static constexpr double kBacklashWormTurnsPerSecond = 1.0 / 16.0;
+
+    // open-astro#437: the side each axis finishes every compensated goto
+    // from, as a count direction (+1 increasing). RA: the tracking direction
+    // of the site's hemisphere, so tracking resumes with the gears already
+    // engaged; Dec: increasing counts. Fixed here, in one place: a later
+    // change can make them config without touching the config keys.
+    int backlash_approach_sign_locked(int channel) const {
+        return channel == kAxisRa ? (ra_axis_sign_locked() > 0.0 ? 1 : -1) : 1;
+    }
+
+    // open-astro#437: the final leg a goto owes: its generation, axes and targets.
+    struct FinalApproach {
+        uint64_t generation = 0;
+        bool owed[2]{};
+        double target_deg[2]{};
+    };
+
+    // open-astro#437: the landing wait calls this whenever the board reports the
+    // goto stopped. The final leg goes out once each axis that owes one has
+    // settled (the rule of every landing), and only while its goto is still the
+    // current motion: a newer motion command (AbortSlew, MoveAxis, a pulse, a
+    // newer goto) bumps motion_generation_ and the leg is dropped unsent. True
+    // when it went out. The position register is never written, so an
+    // unfinished goto leaves nothing to undo.
+    bool send_final_approach_locked(std::unique_lock<std::mutex>& lock) {
+        const FinalApproach leg = final_approach_;
+        final_approach_ = {};
+        for (int i = 0; i < 2; ++i) {
+            if (leg.owed[i] && leg.generation == motion_generation_) {
+                wait_axis_stationary_locked(lock, i + 1);
+            }
+        }
+        if ((!leg.owed[0] && !leg.owed[1]) || leg.generation != motion_generation_ || body_stopped()) {
+            return false;
+        }
+        slewing_cached_ = true;  // as before every goto: a failed first poll of the leg must not land it
+        dispatch_goto_locked(lock, leg.target_deg[0], leg.target_deg[1], /*compensate_backlash=*/false, &leg);
+        return true;
+    }
+
+    // `compensate_backlash` is false for the AutoHome hunt: its moves read the
+    // home index against the count frame, and it waits for its own landings
+    // (autohome_wait_axes_stopped), which never send a final leg. A final leg
+    // (open-astro#437) keeps its goto's generation and moves only the axes that
+    // owe one, in a slow GOTO (':G' mode '2', ':I' the step period) at the
+    // derived speed.
+    void dispatch_goto_locked(std::unique_lock<std::mutex>& lock, double target_ra_axis_deg, double target_dec_axis_deg,
+                              bool compensate_backlash = true, const FinalApproach* final_leg = nullptr) {
         auto& protocol = *protocol_;
-        const uint64_t gen = ++motion_generation_;
+        const uint64_t gen = final_leg ? final_leg->generation : ++motion_generation_;
+        const bool moves[2] = {!final_leg || final_leg->owed[0], !final_leg || final_leg->owed[1]};
         cmd_axis_rate_deg_s_[0] = 0.0;
         cmd_axis_rate_deg_s_[1] = 0.0;
         // A single generation spans BOTH stop-waits and the goto commands
@@ -4472,8 +4696,8 @@ private:
         // generation gate inside the wait ensures a superseded dispatch
         // never emits stops that could clobber the superseding command's
         // fresh motion (round-6 finding).
-        const bool ra_stopped = stop_axis_and_wait_locked(lock, kAxisRa, gen);
-        const bool dec_stopped = stop_axis_and_wait_locked(lock, kAxisDec, gen);
+        const bool ra_stopped = !moves[0] || stop_axis_and_wait_locked(lock, kAxisRa, gen);
+        const bool dec_stopped = !moves[1] || stop_axis_and_wait_locked(lock, kAxisDec, gen);
         if (!ra_stopped || !dec_stopped) {
             throw AlpacaException("Slew superseded before dispatch");
         }
@@ -4488,18 +4712,44 @@ private:
             {kAxisRa, cached_ra_axis_deg_, target_ra_axis_deg},
             {kAxisDec, cached_dec_axis_deg_, target_dec_axis_deg},
         };
+        FinalApproach owes{gen, {false, false}, {target_ra_axis_deg, target_dec_axis_deg}};
         for (const auto& plan : plans) {
-            double delta = plan.target_deg - plan.current_deg;
+            const auto i = static_cast<std::size_t>(plan.channel - 1);
+            if (!moves[i]) {
+                continue;
+            }
+            const uint32_t cpr = axis_params_[i].counts_per_revolution;
+            const double delta = plan.target_deg - plan.current_deg;
+            const uint32_t target = degrees_to_counts(plan.target_deg, cpr);
+            uint32_t first_leg = target;
+            // open-astro#437: a move against the approach side overshoots the
+            // target by the backlash steps; the final leg comes back onto it
+            // from the approach side (send_final_approach_locked(), from the
+            // landing wait). A move of under one count has no direction.
+            const int approach = backlash_approach_sign_locked(plan.channel);
+            if (compensate_backlash && backlash_rate_deg_s_[i] > 0.0 && std::abs(delta) * cpr / 360.0 >= 0.5 &&
+                (delta > 0.0 ? 1 : -1) != approach) {
+                const uint32_t steps = i == 0 ? backlash_.ra.steps : backlash_.dec.steps;
+                first_leg = (approach > 0 ? target - steps : target + steps) & kCountsMask;
+                owes.owed[i] = true;
+            }
             // Motion mode '0' = fast GOTO (the controller manages ramp and the
-            // brake point); direction from the signed move.
-            protocol.set_motion_mode(plan.channel, '0', direction_char(delta));
-            protocol.set_goto_target(
-                plan.channel,
-                degrees_to_counts(plan.target_deg,
-                                  axis_params_[static_cast<std::size_t>(plan.channel - 1)].counts_per_revolution));
+            // brake point), '2' for a final leg; direction from the signed move.
+            protocol.set_motion_mode(plan.channel, final_leg ? '2' : '0', direction_char(delta));
+            if (final_leg) {
+                protocol.set_step_period(plan.channel,
+                                         step_period_for_locked(plan.channel, backlash_rate_deg_s_[i], false));
+            }
+            protocol.set_goto_target(plan.channel, first_leg);
         }
-        protocol.start_motion(kAxisRa);
-        protocol.start_motion(kAxisDec);
+        final_approach_ = owes;  // after a final leg: nothing (it is not compensated)
+        if (owes.owed[0] || owes.owed[1]) {
+            // The landing time of a two-leg goto is no sample of the one-leg
+            // goto overhead the aim-ahead estimate learns (wait_for_slew_complete).
+            last_goto_dispatch_time_ = std::chrono::steady_clock::time_point{};
+        }
+        if (moves[0]) protocol.start_motion(kAxisRa);
+        if (moves[1]) protocol.start_motion(kAxisDec);
         // open-astro#459: every commanded dec-axis angle passes through here
         // (sky goto, the no-indexer FindHome and Park gotos to home, the
         // AutoHome hunt phases), so this is the one place the branch memory
@@ -4548,6 +4798,20 @@ private:
         last_goto_dist_deg_ = dist;
         double est_seconds = dist / kMaxMoveAxisRateDegPerSec + goto_overhead_seconds_ + resume_latency_seconds_;
         auto [t1, t2] = ra_dec_to_axis_degrees_locked(ra, dec, est_seconds * kLstHoursPerSecond);
+        if (std::signbit(p2) != std::signbit(t2)) {
+            // The aim-ahead carries the target across HA = 0, so the goto takes
+            // the other dec-axis branch than the one the distance above was
+            // measured on (a 180 deg RA error that fed a 57 s estimate and
+            // aimed the goto that far ahead). Measure on the branch the goto
+            // will take and aim on it; the landing check reads the same branch
+            // back from pointing_branch_.
+            const int branch = std::signbit(t2) ? -1 : 1;
+            std::tie(p1, p2) = ra_dec_to_axis_degrees_locked(ra, dec, 0.0, branch);
+            dist = std::max(std::abs(p1 - cached_ra_axis_deg_), std::abs(p2 - cached_dec_axis_deg_));
+            last_goto_dist_deg_ = dist;
+            est_seconds = dist / kMaxMoveAxisRateDegPerSec + goto_overhead_seconds_ + resume_latency_seconds_;
+            std::tie(t1, t2) = ra_dec_to_axis_degrees_locked(ra, dec, est_seconds * kLstHoursPerSecond, branch);
+        }
         dispatch_goto_locked(lock, t1, t2);  // records the branch of t2 once the goto is on its way
     }
 
@@ -4562,7 +4826,7 @@ private:
     // the hemisphere's direction. Caller holds mutex_ and has refreshed the
     // position cache.
     double landing_lead_seconds_locked(double ra, double dec) const {
-        const double target_now = ra_dec_to_axis_degrees_locked(ra, dec).first;
+        const double target_now = ra_dec_to_axis_degrees_locked(ra, dec, 0.0, pointing_branch_).first;
         const double sky_sign = hemisphere_south_locked() ? -1.0 : 1.0;
         const double axis_deg_per_second = sky_sign * kHoursToDegrees * kLstHoursPerSecond;
         return (cached_ra_axis_deg_ - target_now) / axis_deg_per_second;
@@ -4601,7 +4865,7 @@ private:
                 break;  // AbortSlew/unpark/disconnect cancelled the slew, or a newer operation replaced it
             }
             refresh_position_cache_locked(true);
-            const double dec_target = ra_dec_to_axis_degrees_locked(ra, dec).second;
+            const double dec_target = ra_dec_to_axis_degrees_locked(ra, dec, 0.0, pointing_branch_).second;
             const bool dec_landed = std::abs(dec_target - cached_dec_axis_deg_) <= kLandingDeadbandDeg;
             // Time to hold before tracking restarts: the sky still has to
             // close the lead, less the restart's own latency.
@@ -5058,7 +5322,8 @@ private:
             up[i] = read_idx(i) == 0;
         }
         refresh_position_cache_locked(true);
-        dispatch_goto_locked(lock, axis_deg(0) + (up[0] ? -5.0 : 5.0), axis_deg(1) + (up[1] ? -5.0 : 5.0));
+        dispatch_goto_locked(lock, axis_deg(0) + (up[0] ? -5.0 : 5.0), axis_deg(1) + (up[1] ? -5.0 : 5.0),
+                             /*compensate_backlash=*/false);
         autohome_wait_axes_stopped(lock);
 
         // Phase 2: if the 5-degree step swept PAST the index (latched), move a
@@ -5073,7 +5338,7 @@ private:
             ALPACA_LOG_INFO("SkyWatcher", "AutoHome phase 2: stepping past a latched index");
             refresh_position_cache_locked(true);
             dispatch_goto_locked(lock, axis_deg(0) + (swept[0] ? (up[0] ? -5.0 : 5.0) : 0.0),
-                                 axis_deg(1) + (swept[1] ? (up[1] ? -5.0 : 5.0) : 0.0));
+                                 axis_deg(1) + (swept[1] ? (up[1] ? -5.0 : 5.0) : 0.0), /*compensate_backlash=*/false);
             autohome_wait_axes_stopped(lock);
             for (int i = 0; i < 2; ++i) {
                 if (swept[i]) {
@@ -5158,9 +5423,11 @@ private:
 
         // Phase 5+6: back 10 degrees below the latched mark, then approach it
         // from below and stamp the position registers to the home offset.
-        dispatch_goto_locked(lock, idx_to_deg(0, home_idx[0]) - 10.0, idx_to_deg(1, home_idx[1]) - 10.0);
+        dispatch_goto_locked(lock, idx_to_deg(0, home_idx[0]) - 10.0, idx_to_deg(1, home_idx[1]) - 10.0,
+                             /*compensate_backlash=*/false);
         autohome_wait_axes_stopped(lock);
-        dispatch_goto_locked(lock, idx_to_deg(0, home_idx[0]), idx_to_deg(1, home_idx[1]));
+        dispatch_goto_locked(lock, idx_to_deg(0, home_idx[0]), idx_to_deg(1, home_idx[1]),
+                             /*compensate_backlash=*/false);
         autohome_wait_axes_stopped(lock);
         proto.set_position(kAxisRa, kHomeCounts);
         proto.set_position(kAxisDec, kHomeCounts);
@@ -5207,7 +5474,7 @@ private:
     }
 
     bool wait_for_slew_complete(std::unique_lock<std::mutex>& lock,
-                                std::optional<uint64_t> expected_generation = std::nullopt) const {
+                                std::optional<uint64_t> expected_generation = std::nullopt) {
         const auto timeout = std::chrono::seconds(180);
         auto start = clock_.now();
         const auto start_grace = std::chrono::seconds(2);
@@ -5235,6 +5502,9 @@ private:
                 if (!saw_slewing && (clock_.now() - start) < start_grace) {
                     sleep_unlocked(std::chrono::milliseconds(200));
                     continue;
+                }
+                if (send_final_approach_locked(lock)) {
+                    continue;  // open-astro#437: land the final leg the same way
                 }
                 break;
             }
@@ -5729,6 +5999,13 @@ private:
             check_not_parked_locked(who);
             validate_ra_dec(ra, dec, who);
             check_target_altitude_locked(ra, dec, who);
+            // ITelescopeV4: an equatorial slew with Tracking false is InvalidOperation
+            // (open-astro#1274). Read it as the Tracking getter does.
+            settle_unconfirmed_tracking_stop_locked();
+            if (!tracking_) {
+                throw AlpacaException(std::string(who) + " requires Tracking to be true",
+                                      AlpacaError::InvalidOperation);
+            }
         };
         {
             // A refused goto must not cancel a goto, park or pulse in flight,
@@ -5899,6 +6176,13 @@ private:
     int dec_axis_sense_ = 0;
     // open-astro#582: the configured decAxisSense; fixed at construction.
     const DecAxisSenseSetting dec_axis_sense_setting_;
+    // open-astro#437: the configured goto backlash compensation; fixed at construction.
+    const BacklashSettings backlash_;
+    // Final-leg speed per axis in deg/s, derived at connect from ":s" and ":a";
+    // 0 = this axis is not compensated (off, or the board gave no worm count).
+    double backlash_rate_deg_s_[2]{};
+    // The final leg the last goto owes, if any (see send_final_approach_locked).
+    FinalApproach final_approach_;
     // open-astro#666: live_rate_change_needs_relatch() of the connected board,
     // true when unknown. Atomic because the pulse task's restore reads it
     // without mutex_.
@@ -5921,7 +6205,11 @@ private:
     mutable std::uint64_t seen_recovery_epoch_ = 0;
     mutable std::chrono::steady_clock::time_point last_position_update_{};
 
-    bool tracking_ = false;
+    // mutable: get_tracking() drops it once a poll confirms a stop whose wait threw.
+    mutable bool tracking_ = false;
+    mutable bool tracking_stop_unconfirmed_ = false;
+    mutable std::chrono::steady_clock::time_point tracking_stop_unconfirmed_since_{};
+    uint64_t tracking_stop_unconfirmed_gen_ = 0;  // motion_generation_ of that stop
     // Number of Tracking=false stop-waits in flight (under mutex_), while
     // tracking_ still reads true. A counter, not a flag: a second setter can
     // enter the wait while the first is in its unlocked poll, and the first
@@ -5933,7 +6221,7 @@ private:
     int tracking_off_pending_ = 0;
     // Caller holds mutex_.
     bool tracking_effectively_on_locked() const { return tracking_ && tracking_off_pending_ == 0; }
-    bool restore_tracking_after_slew_ = false;
+    mutable bool restore_tracking_after_slew_ = false;  // mutable: get_tracking() settle clears it
     mutable bool parked_ = false;
     mutable bool at_home_ = false;
     mutable bool slewing_cached_ = false;
@@ -6121,6 +6409,29 @@ void set_pulse_restore_hook(std::function<void()> hook) {
     pulse_restore_hook_slot() = std::move(hook);
 }
 
+namespace {
+std::function<void()>& pulse_dispatch_failure_hook_slot() {
+    static std::function<void()> hook;
+    return hook;
+}
+}  // namespace
+
+void set_pulse_dispatch_failure_hook(std::function<void()> hook) {
+    std::lock_guard<std::mutex> lock(probe_mutex());
+    pulse_dispatch_failure_hook_slot() = std::move(hook);
+}
+
+void run_pulse_dispatch_failure_hook() {
+    std::function<void()> hook;
+    {
+        std::lock_guard<std::mutex> lock(probe_mutex());
+        hook = pulse_dispatch_failure_hook_slot();
+    }
+    if (hook) {
+        hook();
+    }
+}
+
 void run_pulse_restore_hook() {
     std::function<void()> hook;
     {
@@ -6171,16 +6482,14 @@ bool pointing_uses_client_offset(bool offset_survives, bool host_was_synchronize
 }
 }  // namespace detail
 
-std::unique_ptr<TelescopeDriver> create_skywatcher_telescope(int device_number, const ConnectionInfo& connection_info,
-                                                             std::optional<double> site_latitude_deg,
-                                                             std::optional<double> site_longitude_deg,
-                                                             std::optional<double> site_elevation_m,
-                                                             std::unique_ptr<SkyWatcherProtocolWrapper> protocol,
-                                                             util::MotionLimits motion_limits, util::TaskClock& clock,
-                                                             DecAxisSenseSetting dec_axis_sense) {
+std::unique_ptr<TelescopeDriver> create_skywatcher_telescope(
+    int device_number, const ConnectionInfo& connection_info, std::optional<double> site_latitude_deg,
+    std::optional<double> site_longitude_deg, std::optional<double> site_elevation_m,
+    std::unique_ptr<SkyWatcherProtocolWrapper> protocol, util::MotionLimits motion_limits, util::TaskClock& clock,
+    DecAxisSenseSetting dec_axis_sense, BacklashSettings backlash) {
     return std::make_unique<SkyWatcherTelescopeDriver>(
         device_number, connection_info, site_latitude_deg, site_longitude_deg, site_elevation_m, std::move(protocol),
-        util::ConnectionResolver<ConnectionInfo>{}, motion_limits, clock, dec_axis_sense);
+        util::ConnectionResolver<ConnectionInfo>{}, motion_limits, clock, dec_axis_sense, backlash);
 }
 
 void set_slew_spawn_for_testing(TelescopeDriver& driver, std::function<std::thread(std::function<void()>)> spawn) {
@@ -6205,13 +6514,14 @@ std::unique_ptr<TelescopeDriver> create_skywatcher_telescope_deferred(
     int device_number, util::ConnectionResolver<ConnectionInfo> connection_resolver,
     std::optional<double> site_latitude_deg, std::optional<double> site_longitude_deg,
     std::optional<double> site_elevation_m, std::unique_ptr<SkyWatcherProtocolWrapper> protocol,
-    util::MotionLimits motion_limits, util::TaskClock& clock, DecAxisSenseSetting dec_axis_sense) {
+    util::MotionLimits motion_limits, util::TaskClock& clock, DecAxisSenseSetting dec_axis_sense,
+    BacklashSettings backlash) {
     if (!connection_resolver) {
         throw AlpacaException("Sky-Watcher telescope: a connection resolver is required", AlpacaError::InvalidValue);
     }
     return std::make_unique<SkyWatcherTelescopeDriver>(
         device_number, ConnectionInfo{}, site_latitude_deg, site_longitude_deg, site_elevation_m, std::move(protocol),
-        std::move(connection_resolver), motion_limits, clock, dec_axis_sense);
+        std::move(connection_resolver), motion_limits, clock, dec_axis_sense, backlash);
 }
 
 ConnectionInfo resolve_skywatcher_auto(int mount_index) {
@@ -6252,16 +6562,14 @@ ConnectionInfo resolve_skywatcher_auto(int mount_index) {
     return conn;
 }
 
-std::unique_ptr<TelescopeDriver> create_skywatcher_telescope_auto(int device_number, int mount_index,
-                                                                  std::optional<double> site_latitude_deg,
-                                                                  std::optional<double> site_longitude_deg,
-                                                                  std::optional<double> site_elevation_m,
-                                                                  util::MotionLimits motion_limits,
-                                                                  DecAxisSenseSetting dec_axis_sense) {
+std::unique_ptr<TelescopeDriver> create_skywatcher_telescope_auto(
+    int device_number, int mount_index, std::optional<double> site_latitude_deg,
+    std::optional<double> site_longitude_deg, std::optional<double> site_elevation_m, util::MotionLimits motion_limits,
+    DecAxisSenseSetting dec_axis_sense, BacklashSettings backlash) {
     // The serial scan and UDP discovery run at connect time (#659), not here.
     return create_skywatcher_telescope_deferred(
         device_number, [mount_index] { return resolve_skywatcher_auto(mount_index); }, site_latitude_deg,
-        site_longitude_deg, site_elevation_m, {}, motion_limits, util::default_task_clock(), dec_axis_sense);
+        site_longitude_deg, site_elevation_m, {}, motion_limits, util::default_task_clock(), dec_axis_sense, backlash);
 }
 
 }  // namespace alpacacore::vendor::skywatcher

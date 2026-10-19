@@ -117,6 +117,9 @@ alpacacore::test::FakeMountServer::Responder celestron_responder(std::shared_ptr
                     if (st->reject_level_start.load()) return "";
                     return "#";
                 }
+                if (op == 0xFE) {  // complete the binary firmware reply for each AUX bus probe
+                    return std::string("\x00\x00#", 3);
+                }
                 if (op == 0x12) {
                     st->home_status_polls.fetch_add(1);
                     if (st->invalid_next_home_status.exchange(false)) return std::string("\x01#", 2);
@@ -269,7 +272,13 @@ TEST_CASE("Celestron async - Unpark during a park cancels it", "[celestron][tele
     driver->park();
     REQUIRE(driver->get_slewing());
     CHECK_THROWS_AS(driver->move_axis(0, 0.5), alpacacore::AlpacaException);
-    CHECK_THROWS_AS(driver->slew_to_coordinates_async(5.0, 20.0), alpacacore::AlpacaException);
+    // Tracking is off on this fake: the parked refusal comes first (open-astro#1274).
+    try {
+        driver->slew_to_coordinates_async(5.0, 20.0);
+        FAIL("a slew during a park in flight must be refused");
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::InvalidWhileParked);
+    }
     CHECK_THROWS_AS(driver->sync_to_coordinates(5.0, 20.0), alpacacore::AlpacaException);
     try {
         driver->move_axis(0, 0.5);

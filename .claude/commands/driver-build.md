@@ -548,9 +548,9 @@ Checklist:
 ## Step 6 — AlpacaHTTP integration
 
 All 9 steps required for end-to-end functionality:
-1. Router registration in `AlpacaHTTP/src/http/router.cpp`.
-2. Router includes with `#ifdef ALPACACORE_ENABLE_<VENDOR>` guard.
-3. Config sanitization fields preserved.
+1. Catalog descriptor: `<vendor>_fields.h`, `<vendor>_schema.cpp` and `<vendor>_catalog.cpp` under `AlpacaCore/src/vendors/<vendor>/`, registered in `AlpacaCore/src/catalog/builtin_catalog.cpp` (the router has no vendor arm).
+2. No vendor include in `AlpacaHTTP/src/http/router.cpp` (`scripts/check_layering.py`).
+3. Config sanitization: every persisted field declared in the schema.
 4. Web UI vendor dropdown in `AlpacaHTTP/web/app.js`.
 5. Web UI vendor-specific form fields.
    - **Unique vendor-prefixed `name` on EVERY field** (not just filter wheels): hidden
@@ -747,8 +747,10 @@ cd AlpacaCore && cmake -B build-vendors -DALPACACORE_ENABLE_<VENDOR>=ON && cmake
 
 If any test fails, fix it before proceeding. The test tag filter `"[<vendor>]"` runs only the new vendor's tests for faster iteration.
 
-Build into `build-vendors`, not `build`. The `-D` alone is not enough after a pre-flight: since
-#588 the sanitized pass is the last thing to configure `AlpacaCore/build`, and CMake seeds
+Build into `build-vendors`, not `build`. The `-D` alone is not enough on a reused directory: from
+#588 until #1251 the pre-flight's sanitized pass was the last thing to configure `AlpacaCore/build`
+(it now builds in `AlpacaHTTP/build` and deletes `AlpacaCore/build`, but a `build` from an older
+run or a manual configure can still be there), and CMake seeds
 `CMAKE_CXX_FLAGS` from `CXXFLAGS` on a directory's first configure and then caches it -- so
 reconfiguring `build` keeps `-fsanitize=address,undefined` no matter what you pass, and you
 iterate against a slow, LSan-enabled binary with the `ALPACACORE_TESTS_SANITIZED` cases skipped.
@@ -801,7 +803,7 @@ full hard rule.
 
 After the driver builds and unit tests pass, the user MUST run ConformU against the driver with real hardware on **Linux arm64**, the only supported target. A driver is NOT complete until it has arm64 ConformU results.
 
-**ConformU**: https://github.com/ASCOMInitiative/ConformU — the official ASCOM conformance test suite. Use 4.5.1+ on arm64; 4.5.0 has a known arm64 timing defect (see `AGENTS.md`).
+**ConformU**: https://github.com/ASCOMInitiative/ConformU — the official ASCOM conformance test suite. Use 4.5.2 (build 56139) on arm64, the current standard (`/conformu` installs it); 4.5.0 has a known arm64 timing defect (see `AGENTS.md`).
 
 ### Required validation matrix
 

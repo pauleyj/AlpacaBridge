@@ -249,6 +249,55 @@ function installerStateText(installer) {
     }
 }
 
+// Channel selector of the Software Update card (docs/software-update.md).
+// `status` is the /management/v1/update/status payload. The selector shows the
+// host's effective channel and is disabled, with the reason, while
+// update_packages_url pins the check (ChannelOverridden) or a switch/install
+// is running.
+function channelSelectorState(status) {
+    const source = status || {};
+    const value = source.Channel === 'beta' ? 'beta' : 'stable';
+    if (source.ChannelOverridden) {
+        return { value, disabled: true, note: 'set by update_packages_url' };
+    }
+    const switching = (source.ChannelSwitch || {}).State === 'running';
+    const installing = (source.Installer || {}).State === 'running';
+    if (switching) return { value, disabled: true, note: 'Switching the channel...' };
+    if (installing) return { value, disabled: true, note: 'An update is installing.' };
+    if ((source.ChannelSwitch || {}).State === 'unavailable') {
+        return { value, disabled: true, note: 'Not available on this host.' };
+    }
+    return { value, disabled: false, note: channelDowngradeNotice(value, source.InstalledVersion) };
+}
+
+// What choosing Stable does to a host on a beta build: apt never downgrades,
+// so the build stays until the stable release overtakes it. '' when the
+// installed version is not a pre-release, or the choice is not Stable.
+function channelDowngradeNotice(choice, installedVersion) {
+    const installed = String(installedVersion || '');
+    if (choice !== 'stable' || installed.indexOf('~') < 0) return '';
+    return 'You stay on ' + installed + ' until the stable release overtakes it. ' +
+           'The update card then offers stable releases only.';
+}
+
+// The channel helper half of the payload; '' when there is nothing to say.
+// A finished switch is reported only when this page started it: the helper's
+// transcript outlives the run, and a reload weeks later must not repeat it.
+function channelSwitchText(channelSwitch, startedHere) {
+    const source = channelSwitch || {};
+    if (source.State !== 'running' && !startedHere) return '';
+    switch (source.State) {
+        case 'running':
+            return 'Switching the update channel...';
+        case 'succeeded':
+            return 'The update channel was switched. Check for updates to see what it offers.';
+        case 'failed':
+            return 'Switching the update channel failed.' + (source.Detail ? ' (' + source.Detail + ')' : '');
+        default:
+            return '';
+    }
+}
+
 // Release notes for the Software Update card (docs/software-update.md).
 //
 // docs/releases/X.Y.Z.md is written in a small Markdown subset: "#"/"##"
@@ -469,12 +518,142 @@ function formatSiteCoordinate(value) {
     return text === '-0.000000' ? '0.000000' : text;
 }
 
+// Camera picker for a camera-attached thermal switch (ZWO dew heater, ToupTek and
+// Player One heater/fan). A bare "Camera Index" box let a dew heater bind to a
+// camera with no heater (an ASI290MM Mini at index 0 beside an ASI2600MM Pro at
+// index 1), and a rig can carry several heater cameras (2600MC, 6200, 2400), so
+// the form always asks: nothing is preselected for a new switch and the submit
+// refuses until a camera is picked. `cameras` is the Value of GET
+// /management/v1/thermalcameras ({Index, Name, Serial, HasThermal} each), or
+// null when the listing failed. `saved` is the edited device's {cameraIndex,
+// serialNumber}, or null for a new one. `taken` lists the {cameraIndex,
+// serialNumber} of this vendor's other thermal switches. Option values: ''
+// (nothing picked yet), 'cam:<index>' (an attached camera, sent with its serial
+// when it has one), 'saved' (the saved binding of a camera that is not attached
+// now, sent back unchanged). The server still accepts cameraIndex -1 (Auto) for
+// switches saved that way; the form never offers it.
+const THERMAL_AUTO_INDEX = -1;
+const THERMAL_UNLISTED_INDEXES = 4;
+
+function thermalCameraTaken(camera, taken) {
+    return (taken || []).some(t => (t.serialNumber ? t.serialNumber === camera.Serial
+                                                   : Number(t.cameraIndex) === camera.Index));
+}
+
+function thermalCameraLabel(camera, controls, taken) {
+    return String(camera.Name) + ' (index ' + camera.Index + '), ' +
+        (camera.HasThermal ? 'has a ' : 'no ') + controls +
+        (camera.HasThermal && thermalCameraTaken(camera, taken) ? ', used by another switch' : '');
+}
+
+function thermalSavedIndex(saved) {
+    return !saved || saved.cameraIndex === undefined || saved.cameraIndex === null
+        ? null : Number(saved.cameraIndex);
+}
+
+// The value an edited switch's saved binding selects: an attached camera that
+// has the controls, the not-attached 'saved' entry, or '' when it must be picked
+// again (saved as Auto, or bound to a camera without the controls).
+function thermalSavedValue(cameras, saved) {
+    if (!saved) return '';
+    const serial = saved.serialNumber ? String(saved.serialNumber) : '';
+    const index = thermalSavedIndex(saved);
+    if (!serial && (index === null || index === THERMAL_AUTO_INDEX)) return '';
+    if (Array.isArray(cameras)) {
+        const match = cameras.find(c => (serial ? c.Serial === serial : c.Index === index));
+        if (!match) return 'saved';
+        return match.HasThermal ? 'cam:' + match.Index : '';
+    }
+    if (!serial && index >= 0 && index < THERMAL_UNLISTED_INDEXES) return 'cam:' + index;
+    return 'saved';
+}
+
+function thermalCameraOptions(cameras, saved, controls, current, taken) {
+    const options = [{ value: '', label: 'Choose the camera this ' + controls + ' is on', disabled: true }];
+    if (Array.isArray(cameras)) {
+        // Cameras with the controls first; the rest are shown but cannot be picked.
+        const ordered = cameras.filter(c => c.HasThermal).concat(cameras.filter(c => !c.HasThermal));
+        ordered.forEach(c => options.push({
+            value: 'cam:' + c.Index, label: thermalCameraLabel(c, controls, taken), disabled: !c.HasThermal,
+        }));
+    } else {
+        for (let i = 0; i < THERMAL_UNLISTED_INDEXES; i += 1) {
+            options.push({ value: 'cam:' + i, label: 'Camera index ' + i + ' (not checked)', disabled: false });
+        }
+    }
+    const savedValue = thermalSavedValue(cameras, saved);
+    if (savedValue === 'saved') {
+        const label = saved.serialNumber
+            ? 'Saved camera, serial ' + saved.serialNumber + ' (not attached)'
+            : 'Saved camera, index ' + saved.cameraIndex + ' (not attached)';
+        options.push({ value: 'saved', label, disabled: false });
+    }
+    const pickable = value => options.some(o => o.value === value && !o.disabled);
+    const selected = current && pickable(current) ? current : savedValue;
+    return { options, selected };
+}
+
+// What the submit sends, or null when nothing is picked (the submit refuses).
+function thermalCameraSelection(value, cameras, saved) {
+    if (value === 'saved' && saved) {
+        const result = { cameraIndex: Number(saved.cameraIndex ?? THERMAL_AUTO_INDEX) };
+        if (saved.serialNumber) result.serialNumber = String(saved.serialNumber);
+        return result;
+    }
+    if (typeof value === 'string' && value.startsWith('cam:')) {
+        const index = Number.parseInt(value.slice(4), 10);
+        const result = { cameraIndex: index };
+        const camera = Array.isArray(cameras) ? cameras.find(c => c.Index === index) : null;
+        if (camera && camera.Serial) result.serialNumber = String(camera.Serial);
+        return result;
+    }
+    return null;
+}
+
+function thermalCameraHint(cameras, value, controls, listError, saved, taken) {
+    if (!Array.isArray(cameras)) {
+        return 'Could not list the attached cameras' + (listError ? ': ' + listError : '') +
+            '. Pick the index of the camera this ' + controls + ' is on.';
+    }
+    if (value === 'saved') {
+        return 'The saved camera is not attached. Saving keeps it.';
+    }
+    const thermal = cameras.filter(c => c.HasThermal);
+    if (value === '') {
+        if (thermal.length === 0) {
+            return 'No attached camera reports a ' + controls + '. Plug the camera in, then press Refresh.';
+        }
+        const index = thermalSavedIndex(saved);
+        if (saved && !saved.serialNumber && index === null && Number(saved.cameraId) >= 0) {
+            return 'This switch was saved with camera ID ' + saved.cameraId + ' by an older version. ' +
+                'Choose the camera this ' + controls + ' is on.';
+        }
+        if (saved && !saved.serialNumber && (index === null || index === THERMAL_AUTO_INDEX)) {
+            return 'This switch was saved as Auto. Choose the camera this ' + controls + ' is on.';
+        }
+        const bound = saved ? cameras.find(c => (saved.serialNumber ? c.Serial === String(saved.serialNumber)
+                                                                    : c.Index === index)) : null;
+        if (bound && !bound.HasThermal) {
+            return 'The saved camera, ' + bound.Name + ' (index ' + bound.Index + '), has no ' + controls +
+                '. Choose the camera this ' + controls + ' is on.';
+        }
+        return 'Choose the camera this ' + controls + ' is on.';
+    }
+    const camera = cameras.find(c => 'cam:' + c.Index === value);
+    if (camera && thermalCameraTaken(camera, taken)) {
+        return 'Another switch already uses ' + camera.Name + '.';
+    }
+    return '';
+}
+
 // Browsers ignore this; `node --test` uses it. Guarded rather than a real
 // module so index.html can keep loading the file with a plain <script> tag.
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = { isValidClockSeconds, serverClockError, localZoneLabel, formatServerClock, buildBadgeLabel,
                        updateStatusText, installerStateText, renderReleaseNotes,
+                       channelSelectorState, channelDowngradeNotice, channelSwitchText,
                         HOST_CHECK_ALWAYS_ALLOWED, hostCheckSettings, settingsSaveError,
                         wifiSsidKey, wifiSsidLabel, asiairDuplicateGpioError,
-                        normalizeAlignmentMode, deviceStatus, formatSiteCoordinate };
+                        normalizeAlignmentMode, deviceStatus, formatSiteCoordinate,
+                        thermalCameraOptions, thermalCameraSelection, thermalCameraHint };
 }

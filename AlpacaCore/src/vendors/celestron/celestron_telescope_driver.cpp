@@ -1460,6 +1460,7 @@ public:
             check_not_parked_locked("SlewToCoordinates");
             validate_ra_dec(ra, dec, "SlewToCoordinates");
             check_slew_safety_locked("SlewToCoordinates");
+            check_tracking_for_slew_locked("SlewToCoordinates");
         }
         cancel_async_tasks();
         std::unique_lock<std::mutex> lock(mutex_);
@@ -1486,6 +1487,8 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             check_connected();
             check_not_parked_locked("SlewToCoordinatesAsync");
+            validate_ra_dec(ra, dec, "SlewToCoordinatesAsync");
+            check_tracking_for_slew_locked("SlewToCoordinatesAsync");
         }
         uint32_t ra_raw = 0;
         uint32_t dec_raw = 0;
@@ -2268,6 +2271,14 @@ private:
         }
     }
 
+    // ITelescopeV4: an equatorial slew with Tracking false is InvalidOperation
+    // (open-astro#1274). Read as the Tracking getter reads it.
+    void check_tracking_for_slew_locked(const char* who) const {
+        if (!get_tracking_locked()) {
+            throw AlpacaException(std::string(who) + " requires Tracking to be true", AlpacaError::InvalidOperation);
+        }
+    }
+
     bool get_tracking_locked() const {
         if (!tracking_mode_valid_) {
             tracking_mode_cached_ = CelestronProtocolWrapper::instance().get_tracking_mode();
@@ -2641,7 +2652,7 @@ private:
     static double compute_local_sidereal_time_hours(std::chrono::system_clock::time_point utc_time,
                                                     double longitude_degrees) {
         using namespace std::chrono;
-        double days_since_epoch = duration_cast<seconds>(utc_time.time_since_epoch()).count() / 86400.0;
+        double days_since_epoch = duration<double>(utc_time.time_since_epoch()).count() / 86400.0;
         double jd = 2440587.5 + days_since_epoch;
         double t = (jd - 2451545.0) / 36525.0;
         double gmst = 280.46061837 + 360.98564736629 * (jd - 2451545.0)

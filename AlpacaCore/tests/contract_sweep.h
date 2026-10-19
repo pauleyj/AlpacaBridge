@@ -295,7 +295,7 @@ inline ContractEntry contract_entry_zwo_switch() {
                 return vendor::zwo::create_zwo_dew_heater_switch_by_index(n, 0);
             },
             "protocol document: AGENTS.md + ASCOM ISwitchV3; assumption: the ASIAIR switch drivers behind the same "
-            "router arm have their own entries below"),
+            "descriptor have their own entries below"),
         DisconnectedRead::Static, DisconnectedRead::NotConnected, 0,
         "ZWODewHeaterSwitchDriver: MaxSwitch returns 1; CanWrite and CanAsync validate the id then "
         "ensure_connected()");
@@ -414,7 +414,7 @@ inline ContractEntry contract_entry_ioptron_camera() {
     return with_playerone_actions(make_entry(
         "ioptron_camera", "ioptron", "camera", DeviceType::Camera,
         [](int n) -> std::unique_ptr<AlpacaDriver> { return vendor::playerone::create_playerone_camera(n, 0); },
-        "assumption: the router's ioptron/camera arm reuses the Player One camera driver (router.cpp); "
+        "assumption: the ioptron/camera descriptor reuses the Player One camera driver (playerone_catalog.cpp); "
         "protocol document: AGENTS.md contract"));
 }
 inline ContractEntry contract_entry_playerone_camera() {
@@ -894,7 +894,8 @@ inline std::vector<ContractEntry> contract_entries() {
 // case "Contract sweep tier 2 - hosts match kFakeConnectableRoster" pins the two
 // together. Every row hosts every applicable case and no case is registered where it would assert
 // nothing: target flags on telescopes only, InvalidValue only on types with a static out-of-range probe
-// (invalid_probe_reason_for() states why the others have none). A row whose fake cannot hold a connect
+// (invalid_probe_reason_for() states why the others have none), ImageArray before any exposure on cameras
+// only (issue #1167). A row whose fake cannot hold a connect
 // open states why and the source in its connecting_unobservable reason there instead of skipping the
 // Connecting check silently. A row whose fake covers
 // less than its registry entry says so inline.
@@ -911,6 +912,7 @@ inline constexpr FakeRosterRow kFakeConnectableRoster[] = {
     {"skywatcher", "telescope", "fake_skywatcher_serial_board.h"},  // hosted as skywatcher_telescope_serial
     {"zwo", "telescope", "fake_mount_server.h"},
     {"zwo", "camera", "fake_zwo_sdk.h"},
+    {"zwo", "filterwheel", "fake_zwo_efw_sdk.h"},
     {"celestron", "telescope", "fake_mount_server.h"},
     {"celestron", "telescope", "fake_celestron_cgx_mount.h"},  // direct USB backend
     {"celestron", "telescope", "fake_celestron_aux_server.h"}, // SkyPortal TCP backend
@@ -925,6 +927,7 @@ inline constexpr FakeRosterRow kFakeConnectableRoster[] = {
     {"qhy", "filterwheel", "fake_qhy_cfw3.h"},  // CFW3 serial backend: qhy_filterwheel_cfw3
     {"qhy", "focuser", "fake_qhy_qfocuser.h"},
     {"playerone", "camera", "fake_playerone_sdk.h"},
+    {"playerone", "filterwheel", "fake_playerone_pw_sdk.h"},
     {"touptek", "camera", "fake_touptek_sdk.h"},
     {"altair", "camera", "fake_touptek_sdk.h"},  // the ToupTek camera driver behind the Altair factory
     {"svbony", "camera", "fake_svbony_sdk.h"},

@@ -510,6 +510,23 @@
                         </select>
                         <small>Leave on Auto unless the mount points 12 hours out in hour angle. Only mounts that have not been measured need this; see the troubleshooting guide for the reading that tells you which to pick.</small>
                     </div>
+                    <div class="form-group">
+                        <label for="skywatcher-backlash-enabled-ra">
+                            <input type="checkbox" id="skywatcher-backlash-enabled-ra" name="skywatcherBacklashEnabledRA">
+                            RA backlash compensation
+                        </label>
+                        <label for="skywatcher-backlash-steps-ra">RA backlash (microsteps):</label>
+                        <input type="number" id="skywatcher-backlash-steps-ra" name="skywatcherBacklashStepsRA" min="0" max="100000" step="1" value="0">
+                    </div>
+                    <div class="form-group">
+                        <label for="skywatcher-backlash-enabled-dec">
+                            <input type="checkbox" id="skywatcher-backlash-enabled-dec" name="skywatcherBacklashEnabledDec">
+                            Dec backlash compensation
+                        </label>
+                        <label for="skywatcher-backlash-steps-dec">Dec backlash (microsteps):</label>
+                        <input type="number" id="skywatcher-backlash-steps-dec" name="skywatcherBacklashStepsDec" min="0" max="100000" step="1" value="0">
+                        <small>Off and 0 by default. When on, every goto finishes from the same side: RA in the tracking direction, Dec upward in counts. A goto that would arrive from the other side goes this many microsteps past the target, then comes back onto it at a slow speed derived from the mount. Only gotos are compensated: guide pulses, MoveAxis and the rate properties are not, because autoguiders measure and correct backlash themselves. A board that does not report its worm step count is left uncompensated.</small>
+                    </div>
                 </div>
 
                 <!-- OnStep Telescope Configuration -->
@@ -863,6 +880,19 @@
                         </table>
                     </div>
 
+                    <!-- Dew heater: which ZWO camera's anti-dew heater this switch drives. -->
+                    <div id="zwo-dewheater-fields" style="display: none;">
+                        <div class="form-group">
+                            <label for="zwo-dewheater-camera">Camera:</label>
+                            <div style="display: flex; gap: 8px; align-items: center;">
+                                <select id="zwo-dewheater-camera" style="flex: 1; min-width: 0;"></select>
+                                <button id="zwo-dewheater-camera-refresh" class="btn btn-secondary btn-small" type="button">Refresh</button>
+                            </div>
+                            <small id="zwo-dewheater-camera-hint" role="status"></small>
+                            <small>Pick the ZWO camera whose anti-dew heater this switch drives. It is saved by serial number, so it stays with that camera if the USB order changes. Cameras without a heater are listed but cannot be picked.</small>
+                        </div>
+                    </div>
+
                     <div id="zwo-camera-fields">
                         <div class="form-group">
                             <label for="camera-index">Camera Index:</label>
@@ -965,9 +995,13 @@
 
                     <div id="playerone-switch-fields" style="display: none;">
                         <div class="form-group">
-                            <label for="playerone-switch-camera-index">Camera Index:</label>
-                            <input type="number" id="playerone-switch-camera-index" name="playerOneSwitchCameraIndex" value="0" min="0">
-                            <small>0-based index of the cooled Player One camera whose dew heater and fan this switch controls. The switch shares the camera connection, so it can be added alongside the camera device.</small>
+                            <label for="playerone-switch-camera">Camera:</label>
+                            <div style="display: flex; gap: 8px; align-items: center;">
+                                <select id="playerone-switch-camera" style="flex: 1; min-width: 0;"></select>
+                                <button id="playerone-switch-camera-refresh" class="btn btn-secondary btn-small" type="button">Refresh</button>
+                            </div>
+                            <small id="playerone-switch-camera-hint" role="status"></small>
+                            <small>Pick the cooled Player One camera whose dew heater and fan this switch controls. It is saved by serial number. The switch shares the camera connection, so it can be added alongside the camera device.</small>
                         </div>
                     </div>
 
@@ -1248,14 +1282,18 @@
                             <p class="hint">
                                 Exposes a cooled ToupTek camera's anti-fog dew heater
                                 (and radiator fan) as switch elements. Binds to the camera
-                                by index and shares its SDK connection, so it can be added
+                                you pick below and shares its SDK connection, so it can be added
                                 alongside the camera device. Cooling itself stays on the
                                 Camera device (Cooler / Target Temp), not here.
                             </p>
                             <div class="form-group">
-                                <label for="touptek-thermal-camera-index">Camera Index:</label>
-                                <input type="number" id="touptek-thermal-camera-index" name="touptekThermalCameraIndex" value="0" min="0">
-                                <small>0-based index of the cooled ToupTek camera whose dew heater and fan this switch controls.</small>
+                                <label for="touptek-thermal-camera">Camera:</label>
+                                <div style="display: flex; gap: 8px; align-items: center;">
+                                    <select id="touptek-thermal-camera" style="flex: 1; min-width: 0;"></select>
+                                    <button id="touptek-thermal-camera-refresh" class="btn btn-secondary btn-small" type="button">Refresh</button>
+                                </div>
+                                <small id="touptek-thermal-camera-hint" role="status"></small>
+                                <small>Pick the cooled ToupTek camera whose dew heater and fan this switch controls.</small>
                             </div>
                         </div>
 
@@ -1826,6 +1864,19 @@
                             <button id="update-install" class="btn btn-primary" type="button" onclick="updateInstallClicked()" hidden>Install Update</button>
                         </div>
                     </div>
+                    <div class="update-row">
+                        <div class="wifi-row-label">
+                            <label for="update-channel">Update channel</label>
+                            <small id="update-channel-note"></small>
+                        </div>
+                        <div class="update-actions">
+                            <select id="update-channel" class="wifi-country-select" onchange="updateChannelChanged()" disabled>
+                                <option value="stable">Stable</option>
+                                <option value="beta">Beta</option>
+                            </select>
+                        </div>
+                    </div>
+                    <p id="update-channel-line" class="wifi-substatus"></p>
                     <p class="wifi-hint">Checks the OpenAstro repository for a newer release. Installing runs the same upgrade as <code>apt</code> and restarts the server for a few seconds, so do it between exposures.<button class="info-btn" type="button" aria-label="About software updates" data-info-title="Software Update" data-info-text="Check for Updates reads the newest AlpacaBridge version from apt.openastro.net and compares it with the running one. Install Update asks the system to upgrade the alpacabridge package through apt, exactly as 'sudo apt install --only-upgrade alpacabridge' would, so the download is signature-checked. The server restarts at the end and every connected client is disconnected for a few seconds. Nothing updates on its own.">i</button></p>
                     <div id="update-notes" class="update-notes hidden">
                         <div class="update-notes-header">
@@ -1957,7 +2008,7 @@
         </div>
     </div>
 
-    <script src="/web/format.js?v=12"></script>
-    <script src="/web/app.js?v=43"></script>
+    <script src="/web/format.js?v=13"></script>
+    <script src="/web/app.js?v=44"></script>
 </body>
 </html>

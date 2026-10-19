@@ -39,6 +39,14 @@ option(ALPACACORE_ENABLE_PLAYERONE "Enable Player One vendor support" OFF)
 option(ALPACACORE_ENABLE_WANDERERASTRO "Enable WandererAstro CoverCalibrator vendor support" OFF)
 option(ALPACACORE_ENABLE_ASTROASIS "Enable Astroasis Oasis Focuser vendor support" OFF)
 option(ALPACACORE_ENABLE_GPHOTO "Enable libgphoto2 DSLR/mirrorless camera vendor support" OFF)
+# The gphoto driver links the bundled libgphoto2 built by
+# scripts/build_bundled_gphoto.sh from AlpacaCore/external/libgphoto2/. PREFIX is
+# where the library lives (and is loaded from) at run time; STAGE is a DESTDIR
+# root prepended only to find its headers and .so files at build time.
+set(ALPACACORE_GPHOTO_PREFIX "/usr/lib/alpacabridge/libgphoto2" CACHE PATH
+    "Install prefix of the bundled libgphoto2 (run-time location)")
+set(ALPACACORE_GPHOTO_STAGE "" CACHE PATH
+    "DESTDIR root of a staged bundled libgphoto2 (build-time lookup only; empty = the real prefix)")
 
 # If ALPACACORE_ENABLE_ALL_VENDORS is set, enable all implemented vendor drivers
 # Note: Only enable vendors that are actually implemented (have source files)
@@ -82,6 +90,7 @@ set(ALPACACORE_CORE_SOURCES
     src/core/util/host_clock.cpp
     src/core/util/units.cpp
     src/core/util/rotator_sync_offset_store.cpp
+    src/core/util/thermal_camera_choice.cpp
     src/catalog/device_config.cpp
     src/catalog/device_catalog.cpp
 )
@@ -145,6 +154,7 @@ add_library(alpacacore_builtins STATIC
     src/vendors/gemini/gemini_schema.cpp
     src/vendors/wandererastro/wandererastro_schema.cpp
     src/vendors/zwo/zwo_schema.cpp
+    src/vendors/ioptron/ioptron_schema.cpp
 )
 target_link_libraries(alpacacore_builtins PUBLIC alpacacore)
 add_library(AlpacaCore::alpacacore_builtins ALIAS alpacacore_builtins)
@@ -156,6 +166,8 @@ if(ALPACACORE_ENABLE_ZWO)
     add_subdirectory(src/vendors/zwo)
     if(TARGET alpacacore_zwo)
         target_link_libraries(alpacacore_builtins PRIVATE alpacacore_zwo)
+        # Guards the ZWO registrations in register_builtin_factories(), the dew heater's
+        # thermal camera lister among them.
         target_compile_definitions(alpacacore_builtins PRIVATE ALPACACORE_ENABLE_ZWO)
     endif()
 endif()
@@ -173,6 +185,12 @@ if(ALPACACORE_ENABLE_IOPTRON)
     add_subdirectory(src/vendors/ioptron)
     if(TARGET alpacacore_ioptron)
         target_link_libraries(alpacacore_builtins PRIVATE alpacacore_ioptron)
+        # register_builtin_factories() guards its iOptron factory behind this macro; the
+        # schema's gpioChip check follows the second (the PowerBox needs libgpiod).
+        target_compile_definitions(alpacacore_builtins PRIVATE ALPACACORE_ENABLE_IOPTRON)
+        if(ALPACACORE_IOPTRON_POWERBOX)
+            target_compile_definitions(alpacacore_builtins PRIVATE ALPACACORE_IOPTRON_POWERBOX)
+        endif()
     endif()
 endif()
 
@@ -271,7 +289,8 @@ if(ALPACACORE_ENABLE_TOUPTEK)
     add_subdirectory(src/vendors/touptek)
     if(TARGET alpacacore_touptek)
         target_link_libraries(alpacacore_builtins PRIVATE alpacacore_touptek)
-        # register_builtin_factories() guards its ToupTek factory behind this macro;
+        # register_builtin_factories() guards its ToupTek factory and the thermal switch's
+        # camera lister behind this macro;
         # the schema's gpioChip check and the StellaVita factory follow the second.
         target_compile_definitions(alpacacore_builtins PRIVATE ALPACACORE_ENABLE_TOUPTEK)
         if(ALPACACORE_TOUPTEK_STELLAVITA)

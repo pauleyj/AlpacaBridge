@@ -20,15 +20,15 @@
 //     serial reader thread that a disconnect has to reap, and it writes the
 //     status cache while the Alpaca getters read it.
 //   - Flat Panel Pro CoverCalibrator over fake_gemini_flatpanel.h. This one
-//     is strictly request/response -- no reader thread, and set_connected
-//     (false) reaps nothing. The thread this driver owns is
-//     calibrator_task_thread_, reaped by the DESTRUCTOR
-//     (reap_calibrator_task(true)) rather than by a disconnect.
+//     is strictly request/response -- no reader thread. The background work
+//     this driver owns runs in operation slots (cover and calibrator);
+//     set_connected(false) and the destructor both cancel and join them
+//     through stop_background_operations().
 //
 //     Be precise about how often the storm actually reaches it: most
 //     submissions take the INLINE fast path instead. start_calibrator_task()
 //     claims inline whenever !cover_in_flight_ && calibrator_pending_count_
-//     == 0 (gemini_flatpanel_driver.cpp:897). open_cover()/close_cover() set
+//     == 0 (see start_calibrator_task()). open_cover()/close_cover() set
 //     cover_in_flight_, so while a cover move is in flight a calibrator
 //     submission takes the BACKGROUND path instead; the cover moves feed it.
 //     A second op thread slipping between another thread's gate check and
@@ -148,7 +148,7 @@ void flatpanel_operate(alpacacore::test::StressCallGuard& guard, AlpacaDriver& d
     // start_cover_task() spawns one task thread per drain at most instead of
     // an unbounded chain. The gate does not serialize: two op threads can
     // both see "not moving" and the loser gets InvalidOperation from
-    // start_cover_task() (gemini_flatpanel_driver.cpp:762), which the case
+    // start_cover_task() (see start_cover_task()), which the case
     // lists as expected. halt_cover() takes cover_task_mutex_ against the
     // same transition, so it is stormed alongside the submissions.
     guard([&] {
@@ -209,6 +209,11 @@ TEST_CASE("Gemini PDH Advanced 3 switch - concurrent connect/disconnect/operate 
     alpacacore::test::StressCallGuard guard;
     alpacacore::test::run_lifecycle_stress(*driver, [&guard](AlpacaDriver& d) { pdh_switch_operate(guard, d); });
 
+    // A connect must still succeed once the storm ends. Every in-storm failure
+    // is swallowed by design, so a change that made every connect fail would
+    // otherwise leave this case green while it only exercised fail-fast paths.
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(15)));
+
     // Still 10 s here, deliberately: a disconnect closes the port and reaps
     // the reader thread, it never walks the handshake ladder, so the
     // connect side's extra margin buys nothing on this call.
@@ -221,8 +226,6 @@ TEST_CASE("Gemini PDH Advanced 3 switch - concurrent connect/disconnect/operate 
 }
 
 TEST_CASE("Gemini PDH Advanced 3 switch - destruction races an in-flight connect", "[gemini][switch][stress]") {
-    FakeGeminiPdh hub;
-    const std::string port = hub.slave_path();
     // 25 iterations, not the harness default of 100: unlike a fail-fast
     // case, every iteration here reaches a real handshake, whose first
     // attempt alone sleeps 100 ms before its read. 100 iterations would put
@@ -230,8 +233,14 @@ TEST_CASE("Gemini PDH Advanced 3 switch - destruction races an in-flight connect
     // timeout-minutes bound on the sanitizers-tsan job it runs in, which
     // the whole [stress] suite shares. Do not "restore" the default
     // without re-checking both.
-    alpacacore::test::run_destruction_during_connect_stress(
-        [&port]() { return alpacacore::vendor::gemini::create_gemini_pdh_switch(0, port, 19200); }, 25);
+    // One fresh hub per iteration, so a reply written to the destroyed driver
+    // cannot be read by the next one.
+    alpacacore::test::run_destruction_during_connect_stress_fresh_fake(
+        []() { return std::make_unique<FakeGeminiPdh>(); },
+        [](FakeGeminiPdh& hub) {
+            return alpacacore::vendor::gemini::create_gemini_pdh_switch(0, hub.slave_path(), 19200);
+        },
+        25);
 }
 
 TEST_CASE("Gemini PDH Advanced 3 switch - racing disconnect is never dropped", "[gemini][switch][stress]") {
@@ -259,10 +268,15 @@ TEST_CASE("Gemini Flat Panel Pro - concurrent connect/disconnect/operate stress"
     // NotConnected (racing disconnect) plus InvalidOperation: two op threads
     // can pass the get_cover_moving() gate together and the second
     // open_cover()/close_cover() is refused while the first is in flight
-    // (gemini_flatpanel_driver.cpp:762). Nothing else is expected.
+    // (see start_cover_task()). Nothing else is expected.
     alpacacore::test::StressCallGuard guard(
         {alpacacore::AlpacaError::NotConnected, alpacacore::AlpacaError::InvalidOperation});
     alpacacore::test::run_lifecycle_stress(*driver, [&guard](AlpacaDriver& d) { flatpanel_operate(guard, d); });
+
+    // A connect must still succeed once the storm ends. Every in-storm failure
+    // is swallowed by design, so a change that made every connect fail would
+    // otherwise leave this case green while it only exercised fail-fast paths.
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(15)));
 
     REQUIRE(alpacacore::test::settle_connected(*driver, false, std::chrono::seconds(10)));
     CHECK(driver->get_connected() == false);
@@ -273,11 +287,14 @@ TEST_CASE("Gemini Flat Panel Pro - concurrent connect/disconnect/operate stress"
 }
 
 TEST_CASE("Gemini Flat Panel Pro - destruction races an in-flight connect", "[gemini][covercalibrator][stress]") {
-    FakeGeminiFlatPanel panel;
-    const std::string port = panel.slave_path();
-    // 25 not 100, same reasoning as the PDH destruction case above.
-    alpacacore::test::run_destruction_during_connect_stress(
-        [&port]() { return alpacacore::vendor::gemini::create_gemini_flatpanel_pro(0, port, 9600); }, 25);
+    // 25 not 100, same reasoning as the PDH destruction case above; fresh fake
+    // per iteration for the same reason.
+    alpacacore::test::run_destruction_during_connect_stress_fresh_fake(
+        []() { return std::make_unique<FakeGeminiFlatPanel>(); },
+        [](FakeGeminiFlatPanel& panel) {
+            return alpacacore::vendor::gemini::create_gemini_flatpanel_pro(0, panel.slave_path(), 9600);
+        },
+        25);
 }
 
 TEST_CASE("Gemini Flat Panel Pro - racing disconnect is never dropped", "[gemini][covercalibrator][stress]") {
@@ -299,14 +316,19 @@ TEST_CASE("Gemini focuser - concurrent connect/disconnect/operate stress", "[gem
 
     // Expected set stated explicitly (AGENTS.md, CI section). A connected
     // focuser's only legitimate throw is NotConnected from a racing disconnect
-    // (ensure_connected(), gemini_focuser_driver.cpp:313, and the wrapper's own
-    // check under its lock, gemini_protocol_wrapper.cpp:597). move() clamps
-    // instead of throwing InvalidValue (gemini_focuser_driver.cpp:302), and the
+    // (GeminiFocuserDriver::ensure_connected(), and the wrapper's own
+    // check under its lock, gemini_protocol_wrapper.cpp). move() clamps
+    // instead of throwing InvalidValue in GeminiFocuserDriver::move(), and the
     // fake answers every query. A DriverException (wrapper read/write failure)
     // is deliberately not expected: the fake never fails a transaction, so one
     // would be a real regression.
     alpacacore::test::StressCallGuard guard({alpacacore::AlpacaError::NotConnected});
     alpacacore::test::run_lifecycle_stress(*driver, [&guard](AlpacaDriver& d) { focuser_operate(guard, d); });
+
+    // A connect must still succeed once the storm ends. Every in-storm failure
+    // is swallowed by design, so a change that made every connect fail would
+    // otherwise leave this case green while it only exercised fail-fast paths.
+    REQUIRE(alpacacore::test::settle_connected(*driver, true, std::chrono::seconds(15)));
 
     REQUIRE(alpacacore::test::settle_connected(*driver, false, std::chrono::seconds(10)));
     CHECK(driver->get_connected() == false);
@@ -317,12 +339,12 @@ TEST_CASE("Gemini focuser - concurrent connect/disconnect/operate stress", "[gem
 }
 
 TEST_CASE("Gemini focuser - destruction races an in-flight connect", "[gemini][focuser][stress]") {
-    FakeGeminiFocuser fake;
-    const std::string port = fake.slave_path();
     // 25 not 100, same reasoning as the PDH destruction case above: every
-    // iteration reaches a real handshake.
-    alpacacore::test::run_destruction_during_connect_stress(
-        [&port]() { return alpacacore::vendor::gemini::create_gemini_focuser(0, port); }, 25);
+    // iteration reaches a real handshake. Fresh fake per iteration.
+    alpacacore::test::run_destruction_during_connect_stress_fresh_fake(
+        []() { return std::make_unique<FakeGeminiFocuser>(); },
+        [](FakeGeminiFocuser& fake) { return alpacacore::vendor::gemini::create_gemini_focuser(0, fake.slave_path()); },
+        25);
 }
 
 TEST_CASE("Gemini focuser - racing disconnect is never dropped", "[gemini][focuser][stress]") {

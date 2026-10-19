@@ -32,6 +32,7 @@
 #include "fake_bisque_mount.h"
 #include "fake_mount_server.h"
 #include "fake_task_clock.h"
+#include "sidereal_time_check.h"
 
 using alpacacore::DeviceType;
 
@@ -567,6 +568,58 @@ TEST_CASE("Bisque Telescope Driver - connected slew, sync and MoveAxis refuse no
     driver->set_connected(false);
 }
 
+TEST_CASE("Bisque Telescope Driver - all four equatorial slews are refused while Tracking is false",
+          "[bisque][telescope][unit][tracking-guard]") {
+    ClockedBisque rig;
+    rig.mount.tracking = false;
+    REQUIRE_FALSE(rig.driver->get_tracking());
+
+    // Argument validation comes first: a bad Dec is InvalidValue even with Tracking off.
+    require_alpaca_error([&]() { rig.driver->slew_to_coordinates(5.5, 95.0); }, alpacacore::AlpacaError::InvalidValue);
+    require_alpaca_error([&]() { rig.driver->slew_to_coordinates_async(5.5, 95.0); },
+                         alpacacore::AlpacaError::InvalidValue);
+
+    require_alpaca_error([&]() { rig.driver->slew_to_coordinates(5.5, 20.0); },
+                         alpacacore::AlpacaError::InvalidOperation);
+    require_alpaca_error([&]() { rig.driver->slew_to_coordinates_async(5.5, 20.0); },
+                         alpacacore::AlpacaError::InvalidOperation);
+    rig.driver->set_target_right_ascension(5.5);
+    rig.driver->set_target_declination(20.0);
+    require_alpaca_error([&]() { rig.driver->slew_to_target(); }, alpacacore::AlpacaError::InvalidOperation);
+    require_alpaca_error([&]() { rig.driver->slew_to_target_async(); }, alpacacore::AlpacaError::InvalidOperation);
+
+    // Nothing reached TheSkyX and the driver is not slewing.
+    CHECK(rig.mount.slew_commands.load() == 0);
+    CHECK_FALSE(rig.driver->get_slewing());
+
+    // With Tracking on the same call goes through.
+    rig.mount.tracking = true;
+    REQUIRE_NOTHROW(rig.driver->slew_to_coordinates_async(5.5, 20.0));
+    CHECK(rig.mount.slew_commands.load() == 1);
+}
+
+// The TheSkyX docs do not say what IsTracking reads during a GOTO: a retarget of the driver's own slew in
+// flight is not refused for it. Once TheSkyX reports the slew complete, IsTracking decides again.
+TEST_CASE("Bisque Telescope Driver - a retarget of its own slew in flight is not refused for Tracking",
+          "[bisque][telescope][unit][tracking-guard]") {
+    ClockedBisque rig;
+    rig.mount.slew_polls_needed = 1000;
+    REQUIRE_NOTHROW(rig.driver->slew_to_coordinates_async(5.5, 20.0));
+    rig.clock.advance(std::chrono::seconds(9));  // past the 8 s force window: TheSkyX decides Slewing
+    rig.mount.tracking = false;
+    REQUIRE_FALSE(rig.driver->get_tracking());
+
+    REQUIRE_NOTHROW(rig.driver->slew_to_coordinates_async(6.0, 25.0));
+    CHECK(rig.mount.slew_commands.load() == 2);
+
+    // The slew lands with no Slewing read in between: the next slew is refused.
+    rig.clock.advance(std::chrono::seconds(9));
+    rig.mount.slewing = false;
+    require_alpaca_error([&]() { rig.driver->slew_to_coordinates_async(6.5, 25.0); },
+                         alpacacore::AlpacaError::InvalidOperation);
+    CHECK(rig.mount.slew_commands.load() == 2);
+}
+
 TEST_CASE("Bisque async slew - completion poll errors are surfaced and valid replies are preserved",
           "[bisque][telescope][async][slewfailure]") {
     auto completion_state = std::make_shared<std::atomic<int>>(0);
@@ -575,6 +628,8 @@ TEST_CASE("Bisque async slew - completion poll errors are surfaced and valid rep
         if (command.find("GetRaDec") != std::string::npos) return "|No error. Error = 0.5.5,20.0#";
         if (command.find("GetAzAlt") != std::string::npos) return "|No error. Error = 0.100.0,45.0#";
         if (command.find("IsParked") != std::string::npos) return "|No error. Error = 0.false#";
+        if (command.find("IsTracking") != std::string::npos)
+            return "|No error. Error = 0.1#";  // slews need Tracking (#1274)
         if (command.find("IsSlewComplete") != std::string::npos) {
             switch (completion_state->load()) {
                 case 0:
@@ -710,6 +765,8 @@ TEST_CASE("Bisque PulseGuide - async status remains readable and negative durati
         if (command.find("GetRaDec") != std::string::npos) return "|No error. Error = 0.5.5,20.0#";
         if (command.find("GetAzAlt") != std::string::npos) return "|No error. Error = 0.100.0,45.0#";
         if (command.find("IsParked") != std::string::npos) return "|No error. Error = 0.false#";
+        if (command.find("IsTracking") != std::string::npos)
+            return "|No error. Error = 0.1#";  // slews need Tracking (#1274)
         if (command.find("MoveTelescope") != std::string::npos) {
             state->entered.store(true);
             state->calls.fetch_add(1);
@@ -762,6 +819,8 @@ alpacacore::test::FakeMountServer::Responder bisque_guide_responder(std::chrono:
         if (command.find("GetRaDec") != std::string::npos) return "|No error. Error = 0.5.5,20.0#";
         if (command.find("GetAzAlt") != std::string::npos) return "|No error. Error = 0.100.0,45.0#";
         if (command.find("IsParked") != std::string::npos) return "|No error. Error = 0.false#";
+        if (command.find("IsTracking") != std::string::npos)
+            return "|No error. Error = 0.1#";  // slews need Tracking (#1274)
         if (command.find("MoveTelescope") != std::string::npos) {
             std::this_thread::sleep_for(guide_delay);
             return guide_reply;
@@ -954,6 +1013,8 @@ TEST_CASE("Bisque sync slew - a transient poll failure is tolerated and a persis
         if (command.find("GetRaDec") != std::string::npos) return "|No error. Error = 0.5.5,20.0#";
         if (command.find("GetAzAlt") != std::string::npos) return "|No error. Error = 0.100.0,45.0#";
         if (command.find("IsParked") != std::string::npos) return "|No error. Error = 0.false#";
+        if (command.find("IsTracking") != std::string::npos)
+            return "|No error. Error = 0.1#";  // slews need Tracking (#1274)
         if (command.find("IsSlewComplete") != std::string::npos) {
             polls->fetch_add(1);
             if (fail_polls->load() != 0) {
@@ -1126,4 +1187,13 @@ TEST_CASE("Bisque position cache - the alt-az read ages on the task clock too", 
     rig.clock.advance(std::chrono::seconds(1));
     static_cast<void>(rig.driver->get_azimuth());
     CHECK(rig.mount.altaz_reads.load() == after_connect + 1);
+}
+
+// #1298: the LST helper cut UTC to whole seconds.
+TEST_CASE("Bisque Telescope Driver - SiderealTime follows the clock to under a second", "[bisque][telescope][unit]") {
+    alpacacore::vendor::bisque::ConnectionInfo conn;
+    conn.host = "localhost";
+    conn.tcp_port = 3040;
+    auto driver = alpacacore::vendor::bisque::create_bisque_telescope(0, conn);
+    alpacacore::test::check_sidereal_time_follows_the_clock(*driver);
 }
