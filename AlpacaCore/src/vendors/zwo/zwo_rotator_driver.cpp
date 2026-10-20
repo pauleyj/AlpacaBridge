@@ -276,7 +276,7 @@ public:
     }
 
     void set_target_position(double position) override {
-        validate_angle(position);  // InvalidValue wins over NotConnected (AGENTS.md)
+        validate_angle(position);  // InvalidValue wins over NotConnected (driver-lifecycle.instructions.md)
         ensure_connected();
         std::lock_guard<std::mutex> lock(mutex_);
         target_position_ = normalize_angle(position);
@@ -290,7 +290,7 @@ public:
     }
 
     void move(double position) override {
-        validate_angle(position);  // InvalidValue wins over NotConnected (AGENTS.md)
+        validate_angle(position);  // InvalidValue wins over NotConnected (driver-lifecycle.instructions.md)
         ensure_connected();
         status_cache_.invalidate();  // relative to the live angle, not a frame up to one TTL old
         double current = get_position();
@@ -304,7 +304,7 @@ public:
     }
 
     void move_absolute(double position) override {
-        validate_angle(position);  // InvalidValue wins over NotConnected (AGENTS.md)
+        validate_angle(position);  // InvalidValue wins over NotConnected (driver-lifecycle.instructions.md)
         ensure_connected();
         double target = normalize_angle(position);
         double mechanical_target = to_mechanical_angle(target);
@@ -316,7 +316,7 @@ public:
     }
 
     void move_mechanical(double position) override {
-        validate_angle(position);  // InvalidValue wins over NotConnected (AGENTS.md)
+        validate_angle(position);  // InvalidValue wins over NotConnected (driver-lifecycle.instructions.md)
         ensure_connected();
         double mechanical_target = normalize_angle(position);
         sdk_.move_mechanical(rotator_id_value(), mechanical_target);
@@ -331,7 +331,7 @@ public:
     }
 
     void sync(double position) override {
-        validate_angle(position);  // InvalidValue wins over NotConnected (AGENTS.md)
+        validate_angle(position);  // InvalidValue wins over NotConnected (driver-lifecycle.instructions.md)
         ensure_connected();
         status_cache_.invalidate();  // the offset is taken against the live angle
         double mechanical = read_status().degree;
@@ -447,7 +447,8 @@ private:
     }
 
     double normalize_angle(double angle) const {
-        double wrap = max_degree_ > 0.0 ? max_degree_ : 360.0;
+        const double max_degree = max_degree_.load();
+        double wrap = max_degree > 0.0 ? max_degree : 360.0;
         if (wrap <= 0.0) {
             return angle;
         }
@@ -481,7 +482,9 @@ private:
     ZWOCAARotatorInfo rotator_info_;
     bool rotator_info_valid_;
     double min_degree_;
-    double max_degree_;
+    // Written under mutex_ by the connect path, read lock-free by normalize_angle() from
+    // move()/move_absolute()/sync() before they take mutex_; atomic so the two never race.
+    std::atomic<double> max_degree_;
     double target_position_;
     bool has_target_position_;
     double sync_offset_;

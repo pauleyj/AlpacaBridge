@@ -89,6 +89,60 @@ TEST_CASE("Celestron CGX AUX link - validates transaction timeout bounds", "[cel
     }
 }
 
+TEST_CASE("Celestron CGX AUX link - selects mount and focus motor serial baud rates",
+          "[celestron][cgx][protocol][unit]") {
+    using namespace alpacacore::vendor::celestron;
+    alpacacore::test::FakeCelestronCgxMount fake;
+    REQUIRE(fake.ok());
+    const auto close_file = [](FILE* file) { std::fclose(file); };
+    std::unique_ptr<FILE, decltype(close_file)> observer(std::fopen(fake.slave_path().c_str(), "r+"), close_file);
+    REQUIRE(observer);
+    CelestronCgxProtocol link;
+    for (const auto speed : {AuxLinkSpeed::Baud9600, AuxLinkSpeed::Baud115200}) {
+        link.connect_serial(fake.slave_path(), speed);
+        termios settings{};
+        REQUIRE(::tcgetattr(::fileno(observer.get()), &settings) == 0);
+        const speed_t expected = speed == AuxLinkSpeed::Baud9600 ? B9600 : B115200;
+        CHECK(::cfgetispeed(&settings) == expected);
+        CHECK(::cfgetospeed(&settings) == expected);
+        link.disconnect();
+    }
+}
+
+TEST_CASE("Celestron CGX AUX link - resync clears a timeout but never reopens a closed port",
+          "[celestron][cgx][protocol][unit]") {
+    // Issue #896: the focus motor's Halt resynchronizes before its stop. A
+    // resync that reopened the port could run after a racing disconnect and
+    // leave the port held, exclusive, by a driver reporting Disconnected.
+    alpacacore::test::FakeCelestronCgxMount fake;
+    REQUIRE(fake.ok());
+    alpacacore::vendor::celestron::CelestronCgxProtocol link;
+    link.connect_serial(fake.slave_path());
+
+    fake.set_muted(true);
+    CHECK_THROWS_AS(
+        link.get_axis_position(alpacacore::vendor::celestron::CgxAxis::RightAscension, std::chrono::milliseconds(50)),
+        alpacacore::AlpacaException);
+    REQUIRE_FALSE(link.is_healthy());
+    fake.set_muted(false);
+    link.resync();
+    CHECK(link.is_healthy());
+    CHECK_NOTHROW(link.get_axis_position(alpacacore::vendor::celestron::CgxAxis::RightAscension));
+
+    link.disconnect();
+    try {
+        link.resync();
+        FAIL("Expected AlpacaException");
+    } catch (const alpacacore::AlpacaException& ex) {
+        CHECK(ex.error_code() == alpacacore::AlpacaError::NotConnected);
+    }
+    CHECK_FALSE(link.is_connected());
+    // The port is free: another link can claim it.
+    alpacacore::vendor::celestron::CelestronCgxProtocol other;
+    CHECK_NOTHROW(other.connect_serial(fake.slave_path()));
+    CHECK(other.is_connected());
+}
+
 TEST_CASE("Celestron CGX AUX link - claims kernel exclusive ownership and releases it on reconnect",
           "[celestron][cgx][protocol][integration]") {
     alpacacore::test::FakeCelestronCgxMount mount;

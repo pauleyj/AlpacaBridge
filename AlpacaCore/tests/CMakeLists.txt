@@ -37,6 +37,7 @@ set(TEST_SOURCES
     test_rotator_sync_offset_store.cpp
     test_state_snapshot.cpp
     test_task_clock.cpp
+    test_utc_offset.cpp
     test_thermal_camera_choice.cpp
     test_async_operation.cpp
     test_connection_resolver.cpp
@@ -133,6 +134,8 @@ if(TARGET alpacacore_ioptron)
     list(APPEND TEST_SOURCES test_ioptron_concurrency_stress.cpp)
     # Async slew failure surfaces through Slewing (issue #575).
     list(APPEND TEST_SOURCES test_ioptron_async_slew_failure.cpp)
+    # Clock-sync body runs on an operation slot (issue #1368).
+    list(APPEND TEST_SOURCES test_ioptron_clock_sync_slot.cpp)
     # AbortSlew fences the async dispatch thread (issue #768).
     list(APPEND TEST_SOURCES test_ioptron_abort_slew.cpp)
     # Auto-detect resolves at connect time (issue #659): mount and iEAF.
@@ -214,9 +217,12 @@ if(TARGET alpacacore_celestron)
     list(APPEND TEST_SOURCES test_celestron_telescope_deferred_connect.cpp)
     # Async slew failure surfaces through Slewing (issue #575).
     list(APPEND TEST_SOURCES test_celestron_async_slew_failure.cpp)
+    # Focus motor on its own USB port (issue #896).
+    list(APPEND TEST_SOURCES test_celestron_focuser.cpp test_celestron_focuser_concurrency_stress.cpp)
 endif()
 if(TARGET alpacacore_bisque)
     list(APPEND TEST_SOURCES test_bisque_telescope.cpp)
+    list(APPEND TEST_SOURCES test_bisque_telescope_snapshot.cpp)
     # Covers the mutex-guarded get_connected() driver shape in the [stress]
     # pool (PR #115 round-2 ABBA regression coverage).
     list(APPEND TEST_SOURCES test_bisque_concurrency_stress.cpp)
@@ -236,6 +242,7 @@ if(TARGET alpacacore_touptek)
     # (i.e. libgpiod >= 2.0 was available).
     if(ALPACACORE_TOUPTEK_STELLAVITA)
         list(APPEND TEST_SOURCES test_touptek_switch.cpp)
+        list(APPEND TEST_SOURCES test_touptek_powerbox_seam.cpp)
     endif()
 endif()
 if(TARGET alpacacore_altair)

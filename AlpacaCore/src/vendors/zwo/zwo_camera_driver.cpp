@@ -195,7 +195,7 @@ public:
             sdk.open_camera(resolved_id);
             // Guard the ENTIRE remaining init: the ZWO open is ref-counted, so
             // an unclosed open on a throw is a permanent leak (the next connect
-            // bumps the count and Close never balances) — AGENTS.md connect
+            // bumps the count and Close never balances) — driver-lifecycle.instructions.md connect
             // rule, same shape as the EAF/EFW/CAA siblings.
             try {
                 sdk.init_camera(resolved_id);
@@ -249,7 +249,7 @@ public:
         // a racing operational call fails fast at its connection check instead
         // of hitting a just-closed camera, and a throwing close can't trap the
         // driver half-connected — same order as the switch/EFW/CAA/EAF
-        // siblings, per the AGENTS.md disconnect rule (issue #116).
+        // siblings, per the driver-lifecycle.instructions.md disconnect rule (issue #116).
         const std::optional<int> close_id = camera_id_;
         serial_number_.clear();
         camera_id_.reset();
@@ -270,6 +270,10 @@ public:
             // then wait without holding mutex_ so cached getters stay
             // responsive while the transfer finishes.
             std::lock_guard<std::mutex> image_lock(image_operation_mutex_);
+            // An in-flight download stamps last_download_ns_ before it releases the image lock,
+            // after the reset above; clear it again so the next connection's first start waits
+            // for nothing.
+            last_download_ns_.store(kNoDownload);
             sdk.close_camera(close_id.value());
         }
     }
@@ -325,9 +329,7 @@ public:
     void set_bin_y(int bin_y) override { set_bin_locked(bin_y, bin_y); }
 
     CameraState get_camera_state() const override {
-        if (!connected_.load()) {
-            return CameraState::Idle;
-        }
+        ensure_connected();
         auto status = poll_exposure_status();
         switch (status) {
             case ZWOExposureStatus::Working:
@@ -601,6 +603,9 @@ public:
             latch_image_failure_locked(e.what());
             throw_image_failure_locked();
         }
+        // Recorded before the image lock is released (mutex_ must not be taken under it), so a
+        // start_exposure that wins the lock next sees this download.
+        last_download_ns_.store(clock_.now().time_since_epoch().count());
         image_lock.unlock();
 
         std::lock_guard<std::mutex> lock(mutex_);
@@ -775,9 +780,7 @@ public:
     }
 
     double get_percent_completed() const override {
-        if (!connected_.load()) {
-            return 0.0;
-        }
+        ensure_connected();
         auto state = get_camera_state();
         if (state != CameraState::Exposing) {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -965,6 +968,8 @@ public:
         }
         const long exposure_us = static_cast<long>(std::lround(exposure_us_value));
 
+        wait_for_usb2_download_settle(duration);
+
         int active_camera_id = -1;
         std::uint64_t start_seq = 0;
         bool prior_exposure_needs_check = false;
@@ -1047,6 +1052,33 @@ public:
     void stop_exposure() override { stop_exposure_impl(false); }
 
 private:
+    // Issue #1349. On a USB 2.0 camera (ASI120MM) a long exposure started 0.3-0.45 s after the
+    // previous ASIGetDataAfterExp ends in ASI_EXP_FAILED, which the retry then repairs at the cost of a
+    // second full exposure. Rig-measured on an ASI120MM Mini (beta5, SDK 1.40, 4-9 frames per point):
+    // 5 s and 10 s exposures fail at those gaps and are clean from 0.5 s; 1, 2 and 3 s exposures never
+    // failed at any gap from 0.15 s to 0.5 s. So only an exposure longer than
+    // kUsb2SettleMinExposure waits, until kUsb2PostDownloadSettle after the download, and a guide
+    // loop of short exposures restarts at once. Below 0.3 s the camera also delivers every other
+    // frame early: the next frame becomes ready a fixed time after the previous download whatever the
+    // start time, so it looks started by the camera itself; the wait avoids that for long exposures
+    // and leaves short ones as they were. USB 3.0 cameras show neither.
+    // Called with exposure_trigger_mutex_ held and neither mutex_ nor the image lock held, so
+    // status reads stay live during the wait. stop_exposure queues behind the trigger mutex for at
+    // most this long. set_connected() takes the trigger mutex too, so a disconnect queues behind
+    // the wait (up to this long) and runs after the exposure has started; it then stops it.
+    void wait_for_usb2_download_settle(double duration_s) {
+        if (duration_s <= kUsb2SettleMinExposure.count()) return;
+        const auto downloaded_ns = last_download_ns_.load();
+        if (downloaded_ns == kNoDownload) return;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!camera_info_valid_ || camera_info_.is_usb3) return;
+        }
+        const util::TaskClock::clock::time_point downloaded_at{util::TaskClock::clock::duration(downloaded_ns)};
+        const auto remaining = kUsb2PostDownloadSettle - (clock_.now() - downloaded_at);
+        if (remaining > util::TaskClock::clock::duration::zero()) clock_.sleep_for(remaining);
+    }
+
     void stop_exposure_impl(bool abort) {
         ensure_connected();
         // Serialize against start_exposure and an in-flight retry burst, so
@@ -1159,6 +1191,15 @@ private:
     // Transient-failure recovery (see poll_exposure_status): mutable
     // because the const status readers drive the retry state machine.
     static constexpr int kExposureRetries = 2;
+    // See wait_for_usb2_download_settle(). start_exposure blocks for up to this long, and ConformU
+    // times StartExposure against its 1 s initiator target, so keep it well under 1 s.
+    static constexpr std::chrono::milliseconds kUsb2PostDownloadSettle{600};
+    static constexpr std::chrono::duration<double> kUsb2SettleMinExposure{3.0};
+    static constexpr std::int64_t kNoDownload = std::numeric_limits<std::int64_t>::min();
+    // TaskClock time (ns since its epoch) of the last successful ASIGetDataAfterExp on this
+    // connection, or kNoDownload. Atomic: written under image_operation_mutex_, read under the
+    // trigger mutex, and mutex_ cannot be taken under the image lock.
+    mutable std::atomic<std::int64_t> last_download_ns_{kNoDownload};
     static constexpr std::chrono::milliseconds kExposureRetryInterval{250};
     // Serializes the SDK exposure-lifecycle triggers (user start_exposure,
     // user stop_exposure, and the retry's stop/re-apply/re-trigger burst) so
@@ -1244,6 +1285,7 @@ private:
     }
 
     void reset_exposure_state_locked() {
+        last_download_ns_.store(kNoDownload);
         image_ready_ = false;
         image_cached_ = false;
         exposure_starting_ = false;
@@ -1422,7 +1464,7 @@ private:
         return true;
     }
 
-    // Align UP to the SDK divisor (pad), per the AGENTS.md "Camera ROI
+    // Align UP to the SDK divisor (pad), per the ascom-contract.instructions.md "Camera ROI
     // alignment" rule: keep the client-requested geometry for the interface,
     // pad the SDK ROI so it fully COVERS the request, and stride-crop the
     // delivered frame back to the requested size (ToupTek reference
@@ -1618,7 +1660,7 @@ private:
         return control_caps_or_throw_locked(type);
     }
 
-    // Caps check, id read, and SDK call under ONE mutex_ hold (AGENTS.md
+    // Caps check, id read, and SDK call under ONE mutex_ hold (driver-lifecycle.instructions.md
     // shape (a)) — the previous shape snapshotted the id and called the SDK
     // unlocked, racing a concurrent disconnect's close (issue #116).
     long get_control_value_or_throw(ZWOControlType type) const {
@@ -1651,7 +1693,7 @@ private:
     }
 
     // Runs fn(camera_id) while holding mutex_, so a concurrent disconnect
-    // cannot close the camera underneath the SDK call (AGENTS.md shape (a)).
+    // cannot close the camera underneath the SDK call (driver-lifecycle.instructions.md shape (a)).
     // Fast register/control calls only — never blocking waits or downloads.
     // Must NOT be called with mutex_ already held (non-recursive mutex).
     template <typename Fn>

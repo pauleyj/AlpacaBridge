@@ -48,6 +48,22 @@ TEST_CASE("Celestron AUX TCP - typed commands select the live source while raw e
     CHECK(serial_requests[0].source == 0x00);
 }
 
+TEST_CASE("Celestron AUX TCP - serial resync cannot clear a poisoned TCP session", "[celestron][aux][tcp]") {
+    FakeCelestronAuxServer server;
+    REQUIRE(server.ok());
+    CelestronAuxLink link;
+    link.connect_tcp("127.0.0.1", server.port(), 500ms);
+    link.send_stop(CgxAxis::RightAscension, 500ms);
+    REQUIRE(link.is_desynchronized());
+    const auto generation = link.session_generation();
+    CHECK_THROWS_AS(link.resync(), AlpacaException);
+    CHECK(link.is_connected());
+    CHECK(link.is_desynchronized());
+    CHECK_FALSE(link.is_healthy());
+    CHECK(link.session_generation() == generation);
+    CHECK_THROWS_AS(link.get_axis_position(CgxAxis::RightAscension), AlpacaException);
+}
+
 TEST_CASE("Celestron AUX TCP - an incomplete frame closes the link before any stop can append bytes",
           "[celestron][aux][tcp]") {
     for (const std::uint8_t command : {0x02, 0x50, 0x24}) {

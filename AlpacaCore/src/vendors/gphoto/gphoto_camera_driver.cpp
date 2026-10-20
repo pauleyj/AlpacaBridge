@@ -586,7 +586,7 @@ public:
 
         // Disconnecting: publish disconnected before closing the SDK handle
         // so a racing operational call fails fast at its connection check
-        // instead of hitting a just-closed camera (AGENTS.md disconnect
+        // instead of hitting a just-closed camera (driver-lifecycle.instructions.md disconnect
         // rule). Exposure worker is already joined (lifecycle lock above).
         const int close_handle = handle_;
         handle_ = -1;
@@ -650,7 +650,7 @@ public:
     void set_bin_y(int bin_y) override { reject_non_unity_bin(bin_y); }
 
     CameraState get_camera_state() const override {
-        if (!connected_.load()) return CameraState::Idle;
+        ensure_connected();
         if (exposure_active_.load()) {
             std::lock_guard<std::mutex> lock(mutex_);
             if (exposure_deadline_valid_ && clock_.now() >= exposure_deadline_) {
@@ -878,7 +878,7 @@ public:
     }
 
     double get_percent_completed() const override {
-        if (!connected_.load()) return 0.0;
+        ensure_connected();
         if (!exposure_active_.load()) {
             std::lock_guard<std::mutex> lock(mutex_);
             return image_ready_ ? 100.0 : 0.0;

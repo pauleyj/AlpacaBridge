@@ -73,7 +73,7 @@ int poll_timeout_ms(std::chrono::steady_clock::time_point deadline) {
 
 CelestronAuxLink::~CelestronAuxLink() { disconnect(); }
 
-void CelestronAuxLink::connect_serial(const std::string& port_path) {
+void CelestronAuxLink::connect_serial(const std::string& port_path, AuxLinkSpeed speed) {
     if (port_path.empty()) {
         throw_link_error("a serial port path is required");
     }
@@ -123,9 +123,11 @@ void CelestronAuxLink::connect_serial(const std::string& port_path) {
         settings.c_cflag |= CS8 | CREAD | CLOCAL;
         settings.c_cc[VMIN] = 0;
         settings.c_cc[VTIME] = 0;
-        if (::cfsetispeed(&settings, B115200) != 0 || ::cfsetospeed(&settings, B115200) != 0 ||
+        const speed_t baud = speed == AuxLinkSpeed::Baud9600 ? B9600 : B115200;
+        if (::cfsetispeed(&settings, baud) != 0 || ::cfsetospeed(&settings, baud) != 0 ||
             ::tcsetattr(fd, TCSANOW, &settings) != 0)
-            throw_link_error("cannot configure 115200-baud serial link: " + util::errno_string(errno));
+            throw_link_error(std::string("cannot configure ") + (speed == AuxLinkSpeed::Baud9600 ? "9600" : "115200") +
+                             "-baud serial link: " + util::errno_string(errno));
         if (!util::set_nonblocking(fd))
             throw_link_error("cannot enable bounded serial I/O: " + util::errno_string(errno));
         if (::tcflush(fd, TCIFLUSH) != 0)
@@ -142,6 +144,25 @@ void CelestronAuxLink::connect_serial(const std::string& port_path) {
         registered_port_path_.clear();
         throw;
     }
+}
+
+void CelestronAuxLink::resync() {
+    std::lock_guard<std::timed_mutex> lock(mutex_);
+    if (serial_fd_ < 0) {
+        throw AlpacaException("Celestron AUX link is not connected", AlpacaError::NotConnected);
+    }
+    if (tcp_) {
+        throw AlpacaException("Celestron AUX TCP requires an explicit reconnect", AlpacaError::InvalidOperation);
+    }
+    if (!desynchronized_) return;
+    if (::tcflush(serial_fd_, TCIFLUSH) != 0) {
+        disconnect_locked();
+        throw_link_error("cannot clear stale AUX input before recovery");
+    }
+    receive_buffer_.clear();
+    controller_reports_.clear();
+    desynchronized_ = false;
+    healthy_.store(true);
 }
 
 void CelestronAuxLink::connect_tcp(const std::string& address, int port, std::chrono::milliseconds timeout) {

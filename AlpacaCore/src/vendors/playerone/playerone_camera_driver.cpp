@@ -429,7 +429,7 @@ public:
         // the SDK close so a racing operational call fails fast at its
         // connection check instead of hitting a just-closed camera, and a
         // throwing close can't trap the driver half-connected — same order as
-        // the switch/EFW siblings, per the AGENTS.md disconnect rule (#116).
+        // the switch/EFW siblings, per the driver-lifecycle.instructions.md disconnect rule (#116).
         // The exposure worker is already joined (lifecycle lock above).
         exposure_active_.store(false);
         const int close_id = (camera_info_valid_ && camera_info_.camera_id >= 0) ? camera_info_.camera_id : -1;
@@ -519,7 +519,7 @@ public:
     void set_bin_y(int bin_y) override { set_bin_common(bin_y, bin_y); }
 
     CameraState get_camera_state() const override {
-        if (!connected_.load()) return CameraState::Idle;
+        ensure_connected();
         std::lock_guard<std::mutex> lock(mutex_);
         if (!connected_.load() || !exposure_active_.load() || !exposure_failure_.empty()) return CameraState::Idle;
         if (exposure_deadline_valid_ && clock_.now() >= exposure_deadline_) {
@@ -812,7 +812,7 @@ public:
     }
 
     double get_percent_completed() const override {
-        if (!connected_.load()) return 0.0;
+        ensure_connected();
         if (!exposure_active_.load()) {
             std::lock_guard<std::mutex> lock(mutex_);
             return exposure_failure_.empty() && image_ready_ && last_image_ ? 100.0 : 0.0;
@@ -1490,7 +1490,7 @@ private:
     // integrating: the exposure worker polls/downloads holding no lock, so a
     // mid-exposure write would race the live integration. Requires mutex_
     // held — the same lock start_exposure publishes exposure_active_=true
-    // under, closing the check/publish TOCTOU (M15; AGENTS.md rule, matching
+    // under, closing the check/publish TOCTOU (M15; driver-lifecycle.instructions.md rule, matching
     // the ToupTek driver's ensure_not_exposing).
     void ensure_not_exposing_locked() const {
         if (exposure_active_.load()) {
@@ -1529,7 +1529,7 @@ private:
     }
 
     // Runs fn(camera_id) while holding mutex_, so a concurrent disconnect
-    // cannot close the camera underneath the SDK call (AGENTS.md shape (a)).
+    // cannot close the camera underneath the SDK call (driver-lifecycle.instructions.md shape (a)).
     // Fast register/control calls only — the exposure worker keeps its bare
     // id snapshot because it must not hold mutex_ across the blocking image
     // wait. Must NOT be called with mutex_ already held (non-recursive).

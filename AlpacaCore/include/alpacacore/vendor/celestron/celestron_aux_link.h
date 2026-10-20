@@ -28,6 +28,9 @@ namespace alpacacore::vendor::celestron {
 
 enum class CgxAxis : std::uint8_t { RightAscension = 0x10, Declination = 0x11 };
 
+/// Direct AUX serial rate: 115200 for CGX/CGX-L, 9600 for the focus motor USB port.
+enum class AuxLinkSpeed : std::uint8_t { Baud115200, Baud9600 };
+
 /// Per-driver, serialized AUX link. Serial uses source 0x00; SkyPortal uses 0x20.
 class CelestronAuxLink final {
 public:
@@ -40,7 +43,9 @@ public:
     CelestronAuxLink(const CelestronAuxLink&) = delete;
     CelestronAuxLink& operator=(const CelestronAuxLink&) = delete;
 
-    void connect_serial(const std::string& port_path);
+    void connect_serial(const std::string& port_path, AuxLinkSpeed speed = AuxLinkSpeed::Baud115200);
+    // Flush a held serial port without reopening it; TCP requires explicit reconnect.
+    void resync();
     // Numeric IPv4/IPv6 endpoints only: DNS must not introduce an unbounded wait.
     void connect_tcp(const std::string& address, int port, std::chrono::milliseconds timeout);
     void disconnect();
