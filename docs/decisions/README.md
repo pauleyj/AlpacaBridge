@@ -77,3 +77,4 @@ A record is referred to by its slug until it is written, and numbered then.
 - [Designs to avoid](0013-designs-to-avoid.md)
 - [Mount UTC offset](0014-utc-offset.md)
 - [SDK seams](0015-sdk-seams.md)
+- [SkyPortal logical-disconnect reference continuity](0016-skyportal-logical-reference-continuity.md)

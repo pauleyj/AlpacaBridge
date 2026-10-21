@@ -91,8 +91,8 @@
 #endif
 #ifdef ALPACACORE_ENABLE_CELESTRON
 #include <alpacacore/vendor/celestron/celestron_cgx_telescope_driver.h>
-#include <alpacacore/vendor/celestron/celestron_nexstar_aux_telescope_driver.h>
 #include <alpacacore/vendor/celestron/celestron_focuser_driver.h>
+#include <alpacacore/vendor/celestron/celestron_nexstar_aux_telescope_driver.h>
 #include <alpacacore/vendor/celestron/celestron_telescope_driver.h>
 #endif
 #ifdef ALPACACORE_ENABLE_BISQUE
@@ -522,7 +522,8 @@ inline ContractEntry contract_entry_celestron_nexstar_aux_telescope() {
             info.site_longitude = -75.0;
             return vendor::celestron::create_celestron_nexstar_aux_telescope(n, info);
         },
-        "assumption: initial SkyPortal AUX lifecycle profile enables no motion pending reference and hardware qualification; ASCOM Master Interfaces 1.0.27");
+        "assumption: SkyPortal AUX motion requires a measured reference and remains under hardware qualification; "
+        "ASCOM Master Interfaces 1.0.27");
     entry.can_move_axis = {false, false, false};
     return entry;
 }
@@ -798,7 +799,8 @@ inline ContractEntry contract_entry_astroasis_focuser() {
 #define CS_ONSTEP(X)
 #endif
 #ifdef ALPACACORE_ENABLE_CELESTRON
-#define CS_CELESTRON(X) X(celestron_telescope) X(celestron_cgx_telescope) X(celestron_nexstar_aux_telescope) X(celestron_focuser)
+#define CS_CELESTRON(X) \
+    X(celestron_telescope) X(celestron_cgx_telescope) X(celestron_nexstar_aux_telescope) X(celestron_focuser)
 #else
 #define CS_CELESTRON(X)
 #endif
@@ -929,8 +931,8 @@ inline constexpr FakeRosterRow kFakeConnectableRoster[] = {
     {"zwo", "focuser", "fake_zwo_eaf_sdk.h"},
     {"zwo", "rotator", "fake_zwo_caa_sdk.h"},
     {"celestron", "telescope", "fake_mount_server.h"},
-    {"celestron", "telescope", "fake_celestron_cgx_mount.h"},  // direct USB backend
-    {"celestron", "telescope", "fake_celestron_aux_server.h"}, // SkyPortal TCP backend
+    {"celestron", "telescope", "fake_celestron_cgx_mount.h"},   // direct USB backend
+    {"celestron", "telescope", "fake_celestron_aux_server.h"},  // SkyPortal TCP backend
     {"celestron", "focuser", "fake_celestron_focuser.h"},
     {"synscan", "telescope", "fake_mount_server.h"},
     {"onstep", "telescope", "fake_mount_server.h"},

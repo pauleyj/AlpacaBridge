@@ -23,9 +23,8 @@
 // endpoint is warned about and kept. An unknown alignmentMode is dropped from
 // either source and reads as "auto" (#860).
 
-#include <arpa/inet.h>
-
 #include <alpacacore/util/alignment_mode.h>
+#include <arpa/inet.h>
 
 #include <string>
 

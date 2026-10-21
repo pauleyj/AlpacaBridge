@@ -66,7 +66,7 @@ TEST_CASE("Celestron AUX TCP - serial resync cannot clear a poisoned TCP session
 
 TEST_CASE("Celestron AUX TCP - an incomplete frame closes the link before any stop can append bytes",
           "[celestron][aux][tcp]") {
-    for (const std::uint8_t command : {0x02, 0x50, 0x24}) {
+    for (const std::uint8_t command : {0x02, 0x50, 0x24, 0x06}) {
         INFO("Partial command " << static_cast<int>(command));
         FakeCelestronAuxServer server;
         REQUIRE(server.ok());
@@ -235,15 +235,21 @@ TEST_CASE("Celestron AUX TCP - timeout poisons exchanges but transmits both axis
     CHECK_THROWS_AS(link.get_axis_position(CgxAxis::RightAscension), AlpacaException);
     link.send_stop(CgxAxis::RightAscension, 100ms);
     link.send_stop(CgxAxis::Declination, 100ms);
-    REQUIRE(server.wait_for_requests(3));
+    REQUIRE(server.wait_for_requests(5));
     const auto requests = server.requests();
-    REQUIRE(requests.size() == 3);
+    REQUIRE(requests.size() == 5);
     CHECK(requests[1].destination == 0x10);
-    CHECK(requests[2].destination == 0x11);
+    CHECK(requests[2].destination == 0x10);
+    CHECK(requests[3].destination == 0x11);
+    CHECK(requests[4].destination == 0x11);
     CHECK(requests[1].command == 0x24);
-    CHECK(requests[2].command == 0x24);
+    CHECK(requests[2].command == 0x06);
+    CHECK(requests[3].command == 0x24);
+    CHECK(requests[4].command == 0x06);
     CHECK(requests[1].payload == std::vector<std::uint8_t>{0});
-    CHECK(requests[2].payload == std::vector<std::uint8_t>{0});
+    CHECK(requests[2].payload == std::vector<std::uint8_t>{0, 0, 0});
+    CHECK(requests[3].payload == std::vector<std::uint8_t>{0});
+    CHECK(requests[4].payload == std::vector<std::uint8_t>{0, 0, 0});
     CHECK(link.is_desynchronized());
     link.disconnect();
     server.set_muted(false);
@@ -277,15 +283,21 @@ TEST_CASE("Celestron AUX TCP - report overflow poisons the link without discardi
     CHECK_THROWS_AS(link.get_axis_position(CgxAxis::RightAscension), AlpacaException);
     link.send_stop(CgxAxis::RightAscension, 100ms);
     link.send_stop(CgxAxis::Declination, 100ms);
-    REQUIRE(server.wait_for_requests(36));
+    REQUIRE(server.wait_for_requests(38));
     const auto requests = server.requests();
-    REQUIRE(requests.size() == 36);
+    REQUIRE(requests.size() == 38);
     CHECK(requests[34].destination == 0x10);
-    CHECK(requests[35].destination == 0x11);
+    CHECK(requests[35].destination == 0x10);
+    CHECK(requests[36].destination == 0x11);
+    CHECK(requests[37].destination == 0x11);
     CHECK(requests[34].command == 0x24);
-    CHECK(requests[35].command == 0x24);
+    CHECK(requests[35].command == 0x06);
+    CHECK(requests[36].command == 0x24);
+    CHECK(requests[37].command == 0x06);
     CHECK(requests[34].payload == std::vector<std::uint8_t>{0});
-    CHECK(requests[35].payload == std::vector<std::uint8_t>{0});
+    CHECK(requests[35].payload == std::vector<std::uint8_t>{0, 0, 0});
+    CHECK(requests[36].payload == std::vector<std::uint8_t>{0});
+    CHECK(requests[37].payload == std::vector<std::uint8_t>{0, 0, 0});
 }
 
 TEST_CASE("Celestron AUX TCP - HC and AUX exclude the same endpoint and release claims", "[celestron][aux][tcp]") {

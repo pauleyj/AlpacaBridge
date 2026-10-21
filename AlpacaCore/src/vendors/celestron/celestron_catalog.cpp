@@ -20,8 +20,8 @@
 
 #include <alpacacore/util/alignment_mode.h>
 #include <alpacacore/vendor/celestron/celestron_cgx_telescope_driver.h>
-#include <alpacacore/vendor/celestron/celestron_nexstar_aux_telescope_driver.h>
 #include <alpacacore/vendor/celestron/celestron_focuser_driver.h>
+#include <alpacacore/vendor/celestron/celestron_nexstar_aux_telescope_driver.h>
 #include <alpacacore/vendor/celestron/celestron_telescope_driver.h>
 
 #include <optional>

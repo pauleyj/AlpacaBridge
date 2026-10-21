@@ -1882,7 +1882,7 @@ TEST_CASE("Builtin catalog - SkyPortal AUX selects network and preserves invalid
     CHECK_FALSE(valid.rejection);
 #ifdef ALPACACORE_ENABLE_CELESTRON
     auto driver = catalog.create(kCelestronKey, valid.config, 8);
-    CHECK(driver->get_description() == "Celestron CGX SkyPortal AUX mount (lifecycle-only profile)");
+    CHECK(driver->get_description() == "Celestron SkyPortal AUX mount (home-reference profile)");
     CHECK_FALSE(driver->get_connected());
 #endif
     config.set("connectionType", std::string{"serial"});

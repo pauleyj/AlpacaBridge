@@ -68,8 +68,8 @@
 #include <alpacacore/vendor/celestron/celestron_protocol_wrapper.h>
 #include <alpacacore/vendor/celestron/celestron_telescope_driver.h>
 
-#include "fake_celestron_cgx_mount.h"
 #include "fake_celestron_aux_server.h"
+#include "fake_celestron_cgx_mount.h"
 #include "fake_celestron_focuser.h"
 #endif
 #ifdef ALPACACORE_ENABLE_SYNSCAN
@@ -998,10 +998,18 @@ Tier2Host tier2_host_celestron_nexstar_aux_telescope() {
         info.site_longitude = -75.0;
         return cel::create_celestron_nexstar_aux_telescope(0, info);
     };
-    Tier2Host host{"celestron_telescope_nexstar_aux", "celestron", "telescope", "fake_celestron_aux_server.h",
-                  DeviceType::Telescope, "celestron_telescope_nexstar_aux", {}, false, {}, "",
-                  "Connect verifies stationary encoder samples over 250 ms; no held reply is injected in this profile",
-                  err::InvalidOperation};
+    Tier2Host host{"celestron_telescope_nexstar_aux",
+                   "celestron",
+                   "telescope",
+                   "fake_celestron_aux_server.h",
+                   DeviceType::Telescope,
+                   "celestron_telescope_nexstar_aux",
+                   {},
+                   false,
+                   {},
+                   "",
+                   "Connect verifies stationary encoder samples over 500 ms; no held reply is injected in this profile",
+                   err::InvalidOperation};
     host.connectable = [make](bool) -> Hosted {
         auto fake = std::make_shared<alpacacore::test::FakeCelestronAuxServer>();
         fake->enable_cgx_profile();

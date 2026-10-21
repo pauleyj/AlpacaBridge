@@ -243,6 +243,8 @@ void CelestronAuxLink::send_stop(CgxAxis axis, std::chrono::milliseconds timeout
     ++session_generation_;
     healthy_.store(false);
     write_frame_locked(encode_aux_frame(AuxFrame{source_address_, destination, 0x24, {0}}), deadline);
+    // SkyPortal motion stops can leave sidereal tracking running; share the same send deadline.
+    if (tcp_) write_frame_locked(encode_aux_frame(AuxFrame{source_address_, destination, 0x06, {0, 0, 0}}), deadline);
 }
 
 std::vector<AuxFrame> CelestronAuxLink::take_controller_reports() {

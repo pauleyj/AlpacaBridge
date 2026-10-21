@@ -46,9 +46,9 @@ This verifies their reply shape through this adapter, not the rest of the driver
 
 ## Limits and next gates
 
-The adapter's hardware generation and firmware are **still unknown**. Silence at
-`0xb5` does not identify a generation, prove absence, or justify probing arbitrary
-commands. Obtain its label/model or independently sourced identification procedure.
+The original AUX query did not identify the adapter. The later CFM discovery
+below identifies it as AMW006 with application firmware 2.0.0. Silence at `0xb5`
+alone does not identify a generation or prove absence.
 
 The identity capture itself tested no physical stop, native-guide cancellation, calibration/reference continuity,
 Sync, tracking, GOTO, guiding, manual motion or Park behavior was tested. No
@@ -68,3 +68,44 @@ Earlier unprivileged `nmcli ... --rescan yes` listings showed only cached
 it with `sudo -n` and then reading the completed scan found `Celestron-13`.
 Those earlier listings do **not** establish that the AP was absent. The older
 failed association is retained as historical evidence, not proof of RF absence.
+
+## CFM adapter identification — 2026-10-19 16:04 UTC
+
+The official CFM 3.0.6196 universal JAR previously used for the approved motor
+firmware update was launched in an isolated home/config directory, in offline
+mode with application updates disabled. Its Connections dialog was verified as
+WiFi, manual discovery, `1.2.3.4:2000`. Only **Seek Devices** was selected;
+no firmware update was started.
+
+CFM identified **WiFi Accessory (AMW006)**, **App version = 2.0.0**. Its log records
+the vendor's command-mode identification sequence and exact version reply:
+
+```text
+WifiCommander sending command: $$$
+CMD
+WifiCommander sending command: ver
+Celestron-2.0.0, Built:187d618 for AMW106.5
+<2.40-CEL>
+Found WiFi Accessory (AMW-006)
+WifiCommander sending command: exit
+EXIT
+linkHasEcho = true
+```
+
+CFM's AMW006 model name and the version banner's `AMW106.5` are recorded verbatim;
+do not silently replace either with AMW007. CFM also tested TCP port 3000, found
+no response there, and continued AUX-device discovery after identifying the
+accessory. No custom firmware programmer or motion harness was used.
+
+This matches the second-generation identification described by the
+[NexStar Site firmware-update guide](https://www.nexstarsite.com/OddsNEnds/WiFiBridgeFirmwareUpgradeHowTo.htm).
+That guide limits the documented bridge update to generation 3 (CFM AMW007);
+[Celestron's firmware history](https://www.celestron.com/pages/firmware-update-history)
+lists the third-generation bridge separately. These sources do not establish
+a supported update for this AMW006, nor that firmware causes our observed faults.
+
+Remote evidence: `/home/pauleyj/alpaca-validation/skyportal-cfm-identify-20261019/`
+on the Pi, including `discovered.png`, `wifi-settings.png`, `evidence.sha256` and
+the isolated CFM output log under `home/.local/share/Celestron/CFM/Stable/Logs/`.
+CFM and its private Xvfb were stopped, normal Pi WiFi restored and the temporary
+profile removed. The installed daemon and original CFM preferences were unchanged.

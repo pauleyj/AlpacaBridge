@@ -54,7 +54,7 @@ public:
     bool is_healthy() const { return healthy_.load(); }
     std::uint64_t session_generation() const { return session_generation_.load(); }
 
-    // Sends only MC_MOVE_POS(0), even on a poisoned stream. Not proof of stopping.
+    // Send-only MC_MOVE_POS(0), plus zero tracking rate on TCP, even on a poisoned stream. Not proof of stopping.
     void send_stop(CgxAxis axis, std::chrono::milliseconds timeout);
     // Bounded pending reports, consumed by the driver outside the link lock.
     std::vector<AuxFrame> take_controller_reports();
